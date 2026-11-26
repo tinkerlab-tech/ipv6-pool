@@ -1,0 +1,126 @@
+name: Linux compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ipv6-pool.sh
+      - tests/**
+      - .github/workflows/compatibility.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  distributions:
+    name: ${{ matrix.name }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: Ubuntu 20.04, image: 'ubuntu:20.04', arch: amd64, packages: apt}
+          - {name: Ubuntu 22.04, image: 'ubuntu:22.04', arch: amd64, packages: apt}
+          - {name: Ubuntu 24.04, image: 'ubuntu:24.04', arch: amd64, packages: apt}
+          - {name: Ubuntu 26.04, image: 'ubuntu:26.04', arch: amd64, packages: apt}
+          - {name: Ubuntu 24.04, image: 'ubuntu:24.04', arch: arm64, runner: ubuntu-24.04-arm, packages: apt}
+          - {name: Debian 11, image: 'debian:11', arch: amd64, packages: apt}
+          - {name: Debian 12, image: 'debian:12', arch: amd64, packages: apt}
+          - {name: Debian 13, image: 'debian:13', arch: amd64, packages: apt}
+          - {name: AlmaLinux 8, image: 'almalinux:8', arch: amd64, packages: dnf}
+          - {name: AlmaLinux 9, image: 'almalinux:9', arch: amd64, packages: dnf}
+          - {name: Rocky Linux 8, image: 'rockylinux/rockylinux:8', arch: amd64, packages: dnf}
+          - {name: Rocky Linux 9, image: 'rockylinux/rockylinux:9', arch: amd64, packages: dnf}
+          - {name: CentOS Stream 9, image: 'quay.io/centos/centos:stream9', arch: amd64, packages: dnf}
+          - {name: Alpine 3.23, image: 'alpine:3.23', arch: amd64, packages: apk, backend: openrc}
+          - {name: Alpine 3.24, image: 'alpine:3.24', arch: amd64, packages: apk, backend: openrc}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test IPv6 lifecycle with distribution packages
+        env:
+          IMAGE: ${{ matrix.image }}
+          PACKAGES: ${{ matrix.packages }}
+          BACKEND: ${{ matrix.backend || 'systemd' }}
+        run: |
+          docker run --rm --privileged --volume "$GITHUB_WORKSPACE:/work:ro" \
+            --env PACKAGES --env BACKEND "$IMAGE" sh -euc '
+              case "$PACKAGES" in
+                apt)
+                  apt-get -qq update
+                  DEBIAN_FRONTEND=noninteractive apt-get -yq install --no-install-recommends \
+                    bash iproute2 util-linux coreutils grep awk python3
+                  ;;
+                dnf)
+                  dnf -y install --setopt=install_weak_deps=False \
+                    bash iproute util-linux grep gawk python3
+                  ;;
+                apk)
+                  apk add --no-cache bash iproute2 flock util-linux-misc python3
+                  ;;
+              esac
+              cat /etc/os-release
+              uname -m
+              bash --version
+              ip -V
+              cd /work
+              bash tests/lifecycle.sh "$BACKEND"
+              if [ "$BACKEND" != openrc ]; then bash tests/lifecycle.sh rc.local; fi
+            '
+
+  systemd:
+    name: Ubuntu 24.04 / real systemd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the installed startup service on an isolated IPv6 network
+        run: |
+          sudo bash -s <<'TEST'
+          set -euo pipefail
+          state=/var/lib/ipv6-pool
+          unit=ipv6-pool-restore.service
+          namespace=ipv6-pool-ci
+          dropin="/run/systemd/system/$unit.d"
+          script="$PWD/ipv6-pool.sh"
+          [[ ! -e $state && ! -e /etc/systemd/system/$unit && ! -e $dropin && ! -e /run/netns/$namespace ]]
+          cleanup() {
+            if [[ -d $state ]]; then
+              printf '5\n' | ip netns exec "$namespace" bash "$script" || true
+            fi
+            rm -f "$dropin/namespace.conf"
+            rmdir "$dropin" 2>/dev/null || true
+            systemctl daemon-reload || true
+            ip netns del "$namespace"
+          }
+          ip netns add "$namespace"
+          trap cleanup EXIT
+          ip netns exec "$namespace" ip link add ci6 type dummy
+          ip netns exec "$namespace" ip link set ci6 up
+          ip netns exec "$namespace" ip -6 addr add 2001:db8:7::2/64 dev ci6 nodad
+          ip netns exec "$namespace" ip -6 route add default dev ci6
+          node='vless://00000000-0000-4000-8000-000000000001@example.test:443?security=tls#CI'
+          printf '%s\n' 1 1 "$node" 0 | ip netns exec "$namespace" bash "$script"
+          systemctl is-enabled "$unit"
+          mkdir -p "$dropin"
+          printf '[Service]\nNetworkNamespacePath=/run/netns/%s\n' "$namespace" > "$dropin/namespace.conf"
+          systemctl daemon-reload
+          read -r address < "$state/ips.list"
+          ip netns exec "$namespace" ip -6 addr del "$address/64" dev ci6
+          systemctl start "$unit"
+          [[ $(systemctl show -p Result --value "$unit") == success ]]
+          [[ -n $(ip netns exec "$namespace" ip -o -6 addr show dev ci6 to "$address/128") ]]
+          printf '5\n' | ip netns exec "$namespace" bash "$script"
+          [[ ! -e $state && ! -e /etc/systemd/system/$unit ]]
+          [[ -z $(ip netns exec "$namespace" ip -o -6 addr show dev ci6 to "$address/128") ]]
+          [[ -n $(ip netns exec "$namespace" ip -o -6 addr show dev ci6 to 2001:db8:7::2/128) ]]
+          TEST

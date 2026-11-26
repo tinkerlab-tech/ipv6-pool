@@ -158,12 +158,14 @@ grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret@[${old[0]}]:443?ve
 
 if command -v python3 >/dev/null; then
     vmess='{"v":"2","add":"example.test","port":"443","id":"test","ps":"a/b+c-v6-prod-v6-100","tls":"tls","extra":{"nested":true}}'
-    encoded=$(printf '%s' "$vmess" | base64 | tr -d '\n=' | tr '+/' '-_')
+    encoded=$(printf '%s' "$vmess" | base64 | tr -d '\n=' | tr '/+' '_-')
     run 2 "vmess://$encoded" 0 > /run/reused
     python3 - "$state/nodes.txt" "${old[0]}" "$vmess" <<'PY'
 import base64, json, sys
 with open(sys.argv[1], encoding="ascii") as nodes:
-    actual = json.loads(base64.b64decode(nodes.readline().strip().removeprefix("vmess://")))
+    line = nodes.readline().strip()
+    assert line.startswith("vmess://")
+    actual = json.loads(base64.b64decode(line[len("vmess://"):]))
 expected = json.loads(sys.argv[3])
 expected.update(add=sys.argv[2], ps="a/b+c-v6-prod-v6-01", sni="example.test")
 assert actual == expected
