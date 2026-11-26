@@ -187,8 +187,9 @@ PY
 fi
 
 if command -v jq >/dev/null; then
+    bash_bin=$(command -v bash)
     mkdir -p /run/jq-bin
-    for tool in ip flock awk grep od base64 tr chmod cp mv rm mkdir rmdir cat sleep jq systemctl rc-update; do
+    for tool in bash ip flock awk grep od base64 tr chmod cp mv rm mkdir rmdir cat sleep jq systemctl rc-update; do
         if tool_path=$(command -v "$tool" 2>/dev/null); then
             ln -sf "$tool_path" "/run/jq-bin/$tool"
         fi
@@ -199,7 +200,7 @@ if command -v jq >/dev/null; then
     vmess_zero_port='{"v":"2","add":"example.test","port":"0443","id":"test","ps":"zero"}'
     encoded_zero=$(printf '%s' "$vmess_zero_port" | base64 | tr -d '\n')
     printf '%s\n' 2 "vmess://uuid@example.test:443" "vmess://$bad_vmess_port" "vmess://$encoded_int" 0 |
-        PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+        PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
     grep -Fq 'Base64 JSON' /run/reused
     grep -Fq 'VMess 链接无效' /run/reused
     if command -v python3 >/dev/null; then
@@ -214,10 +215,10 @@ expected.update(add=sys.argv[2], ps="jq-v6-01", sni="example.test")
 assert actual == expected
 PY
     fi
-    printf '%s\n' 2 "vmess://$encoded_zero" 0 | PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+    printf '%s\n' 2 "vmess://$encoded_zero" 0 | PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
     grep -Fq 'vmess://' "$state/nodes.txt"
     rm -f /run/jq-bin/jq
-    printf '%s\n' 2 "vmess://$encoded_int" '' 0 | PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+    printf '%s\n' 2 "vmess://$encoded_int" '' 0 | PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
     grep -Fq 'VMess 需要 python3 或 jq' /run/reused
     rm -rf /run/jq-bin
 fi

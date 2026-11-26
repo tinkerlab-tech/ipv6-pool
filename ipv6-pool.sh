@@ -661,7 +661,7 @@ for index, address in enumerate(sys.argv[2:], 1):
                or (.id | type != "string" or length == 0)
                or (
                    ((.port | type == "number" and . == floor and . >= 1 and . <= 65535)
-                    or (.port | type == "string" and test("^[0-9]{1,5}$") and (sub("^0+(?=[0-9])"; "") | tonumber | . >= 1 and . <= 65535)))
+                    or (.port | type == "string" and test("^[0-9]{1,5}$") and (sub("^0+"; "") | if length == 0 then 0 else tonumber end | . >= 1 and . <= 65535)))
                    | not
                )
                or ((.ps // "") | type != "string") or .ps == false
