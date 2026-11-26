@@ -21,16 +21,19 @@ CONFIG=$STATE/pool.conf
 PROTECTED=$STATE/protected.list
 IPS=$STATE/ips.list
 OWNED=$STATE/owned.list
+PROOFS=$STATE/ownership.list
 PENDING=$STATE/pending.ip
 NODES=$STATE/nodes.txt
+TRANSITION=$STATE/pool.next
 # 匹配备注末尾的旧池标记，也能清理过去重复追加的标记。
 V6_NAME_SUFFIX='(^|-)v6(-([0-9]{2}|100))?(-v6(-([0-9]{2}|100))?)*'
 
-declare -a pool=()
-declare -A protected=() owned=() wanted=() present=() live=() route_sources=()
+declare -a pool=() next_pool=() dad_failed=()
+declare -A protected=() owned=() proofs=() wanted=() present=() live=() route_sources=()
 device='' prefix='' mask=''
 detected_dev='' detected_prefix='' detected_mask='' detection_error=''
-address_snapshot='' routes=''
+address_snapshot='' routes='' boot_id=''
+binding_details='' binding_index='' binding_removed=0
 
 info() { printf '%s\n' "$@"; }
 error() { printf 'IPv6 节点池：%s\n' "$*" >&2; }
@@ -108,11 +111,11 @@ valid_pool_ip() {
 }
 
 read_state() {
-    local address extra
+    local address proof extra
     device='' prefix='' mask=''
-    pool=() protected=() owned=() wanted=()
+    pool=() protected=() owned=() proofs=() wanted=()
     if [[ ! -e $CONFIG ]]; then
-        [[ ! -e $IPS && ! -e $OWNED && ! -e $PENDING ]]
+        [[ ! -e $IPS && ! -e $OWNED && ! -e $PROOFS && ! -e $PENDING && ! -e $TRANSITION ]]
         return
     fi
     read -r device prefix mask extra < "$CONFIG" || return 1
@@ -122,21 +125,45 @@ read_state() {
     while IFS= read -r address || [[ -n $address ]]; do
         [[ $address =~ ^([0-9a-f]{4}:){7}[0-9a-f]{4}$ ]] || return 1
         protected[$address]=1
-    done < "$PROTECTED"
+    done < "$PROTECTED" || return 1
     if [[ -e $IPS ]]; then
         while IFS= read -r address || [[ -n $address ]]; do
             valid_pool_ip "$address" && [[ ! ${wanted[$address]+yes} ]] || return 1
             pool+=("$address")
             wanted[$address]=1
-        done < "$IPS"
+        done < "$IPS" || return 1
     fi
     if [[ -e $OWNED ]]; then
         while IFS= read -r address || [[ -n $address ]]; do
             valid_pool_ip "$address" || return 1
             owned[$address]=1
-        done < "$OWNED"
+        done < "$OWNED" || return 1
+    fi
+    if [[ -e $PROOFS ]]; then
+        while read -r address proof extra || [[ -n $address ]]; do
+            valid_pool_ip "$address" && [[ $proof =~ ^[0-9a-f-]{36}:[0-9]+:[0-9]+$ && -z $extra ]] || return 1
+            proofs[$address]=$proof
+        done < "$PROOFS" || return 1
     fi
     (( ${#pool[@]} <= 100 ))
+}
+
+# pool.next 在新池验证通过后原子写入。中断后先补齐两个对外文件，再清理旧绑定。
+finish_transition() {
+    local address node
+    local -a addresses=() links=()
+    local -A recorded=()
+    [[ -e $TRANSITION ]] || return 0
+    while IFS=$'\t' read -r address node || [[ -n $address ]]; do
+        valid_pool_ip "$address" && [[ ${owned[$address]+yes} && ! ${recorded[$address]+yes} &&
+            $node == *://* && ! $node =~ [[:space:][:cntrl:]] ]] || return 1
+        recorded[$address]=1
+        addresses+=("$address")
+        links+=("$node")
+    done < "$TRANSITION" || return 1
+    (( ${#addresses[@]} && ${#addresses[@]} <= 100 )) || return 1
+    write_file "$IPS" "${addresses[@]}" && write_file "$NODES" "${links[@]}" &&
+        rm -f "$TRANSITION" && read_state
 }
 
 scan_addresses() {
@@ -244,40 +271,122 @@ init_pool() {
         read_state
 }
 
-# 只动已记账地址，并再次检查原生快照、显式默认源地址及绑定属性。
+lookup_binding() {
+    local address=$1 snapshot index dev family cidr details expanded
+    binding_details='' binding_index=''
+    snapshot=$(ip -o -6 addr show to "$address/128") || return 1
+    while read -r index dev family cidr details; do
+        [[ ${dev%%@*} == "$device" && $family == inet6 && ${cidr##*/} == "$mask" ]] || continue
+        if ! expand_ipv6 "${cidr%/*}" || [[ $expanded != "$address" ]]; then continue; fi
+        binding_index=${index%:}
+        binding_details=" $details "
+        break
+    done <<< "$snapshot"
+}
+
+# ip addr save 输出原始 rtnetlink 消息。读取 IFA_CACHEINFO.cstamp，
+# 用启动 ID、接口编号和内核地址创建时间区分删除后被其他程序重建的绑定。
+binding_proof() {
+    local address=$1 stamp
+    [[ $binding_index =~ ^[0-9]+$ ]] || return 1
+    stamp=$(ip -6 addr save dev "$device" | od -An -v -tu1 |
+        awk -v target="${address//:/}" -v ifindex="$binding_index" -v mask="$mask" '
+        function aligned(n) { return int((n + 3) / 4) * 4 }
+        function u16(p) { return little ? b[p] + 256*b[p+1] : 256*b[p] + b[p+1] }
+        function u32(p) { return little ? u16(p) + 65536*u16(p+2) : 65536*u16(p) + u16(p+2) }
+        { for (i=1; i<=NF; i++) b[++size] = $i }
+        END {
+            # iproute2 的地址转储魔数为 0x47361222。
+            if (b[1]==34 && b[2]==18 && b[3]==54 && b[4]==71) little=1
+            else if (b[1]!=71 || b[2]!=54 || b[3]!=18 || b[4]!=34) exit 1
+            for (p=5; p+23<=size; p+=aligned(msg_len)) {
+                msg_len=u32(p)
+                if (msg_len<24 || p+msg_len-1>size) exit 1
+                if (u16(p+4)!=20 || b[p+16]!=10 || b[p+17]!=mask || u32(p+20)!=ifindex) continue
+                local_ip=""; address_ip=""; created=""
+                for (a=p+24; a+3<p+msg_len; a+=aligned(attr_len)) {
+                    attr_len=u16(a); kind=u16(a+2)
+                    if (attr_len<4 || a+attr_len>p+msg_len) exit 1
+                    if ((kind==1 || kind==2) && attr_len==20) {
+                        hex=""
+                        for (j=a+4; j<a+20; j++) hex=hex sprintf("%02x", b[j])
+                        if (kind==2) local_ip=hex
+                        else address_ip=hex
+                    }
+                    if (kind==6 && attr_len>=20) created=sprintf("%.0f", u32(a+12))
+                }
+                if ((local_ip!="" ? local_ip : address_ip)==target && created!="") {
+                    print created
+                    exit
+                }
+            }
+            exit 1
+        }') || return 1
+    [[ $stamp =~ ^[0-9]+$ ]] || return 1
+    printf '%s:%s:%s\n' "$boot_id" "$binding_index" "$stamp"
+}
+
+save_proofs() {
+    local address
+    local -a entries=()
+    for address in "${!proofs[@]}"; do entries+=("$address ${proofs[$address]}"); done
+    write_file "$PROOFS" "${entries[@]}"
+}
+
+# 删除前只查目标地址，并核对当前绑定的归属及默认路由来源。
 remove_owned() {
-    local address=$1 details
-    scan_routes && scan_addresses || return 1
-    details=${live["$device/$address/$mask"]-}
-    if [[ -n $details ]]; then
+    local address=$1 proof
+    binding_removed=0
+    lookup_binding "$address" || return 1
+    if [[ -n $binding_details ]]; then
+        scan_routes || return 1
         if [[ ${protected[$address]+yes} || ${route_sources[$address]+yes} ||
-            $details != *' scope global '* || $details != *' noprefixroute '* ||
-            $details != *' valid_lft forever '* || ! $details =~ [[:space:]]preferred_lft\ 0(sec)?[[:space:]] ]]; then
-            error "保留 $address，当前地址属性或路由用途已变化。"
-        elif ! ip -6 addr del "$address/$mask" dev "$device"; then
-            return 1
+            $binding_details != *' scope global '* || $binding_details != *' noprefixroute '* ||
+            $binding_details != *' valid_lft forever '* ||
+            ! $binding_details =~ [[:space:]]preferred_lft\ 0(sec)?[[:space:]] ||
+            ${proofs[$address]-} != "$boot_id":* ]] ||
+            ! proof=$(binding_proof "$address") || [[ $proof != "${proofs[$address]}" ]]; then
+            error "保留 $address，当前绑定的归属、属性或路由用途无法确认。"
+        else
+            ip -6 addr del "$address/$mask" dev "$device" || return 1
+            binding_removed=1
         fi
     fi
-    unset 'owned[$address]'
-    write_file "$OWNED" "${!owned[@]}"
+    unset 'owned[$address]' 'proofs[$address]'
+    write_file "$OWNED" "${!owned[@]}" && save_proofs
 }
 
 recover_pending() {
-    local address expanded
+    local address proof
     [[ -e $PENDING ]] || return 0
     IFS= read -r address < "$PENDING" && valid_pool_ip "$address" || return 1
     scan_addresses || return 1
-    if [[ ! ${owned[$address]+yes} && ${present[$address]+yes} ]]; then
-        error "保留上次中断时出现的 $address，无法确认它的绑定来源。"
-        protected[$address]=1
-        write_file "$PROTECTED" "${!protected[@]}" || return 1
+    if [[ ${present[$address]+yes} ]]; then
+        lookup_binding "$address" || return 1
+        if [[ ! ${protected[$address]+yes} && ${proofs[$address]-} == "$boot_id":* ]] &&
+            proof=$(binding_proof "$address") && [[ $proof == "${proofs[$address]}" ]]; then
+            owned[$address]=1
+            write_file "$OWNED" "${!owned[@]}" || return 1
+        else
+            error "保留上次中断时出现的 $address，无法确认它的绑定来源。"
+            protected[$address]=1
+            write_file "$PROTECTED" "${!protected[@]}" || return 1
+        fi
     fi
     rm -f "$PENDING"
 }
 
 bind_address() {
-    local address=$1
-    if [[ ${live["$device/$address/$mask"]+yes} ]]; then return 0; fi
+    local address=$1 mode=${2:-restore} proof
+    local key="$device/$address/$mask" binding_removed
+    if [[ ${live[$key]+yes} ]]; then
+        [[ $mode != fresh ]] || return 1
+        # 已发布地址只尝试修复同一个 IP，避免旧分享链接悄然失效。
+        if [[ ${live[$key]} != *' dadfailed '* || ! ${owned[$address]+yes} ]]; then return 0; fi
+        remove_owned "$address" || return 1
+        (( binding_removed )) || return 0
+        unset 'live[$key]' 'present[$address]'
+    fi
     if [[ ${protected[$address]+yes} || ${present[$address]+yes} ]]; then
         error "地址 $address 已被保护或在其他接口/掩码上使用。"
         return 1
@@ -286,63 +395,99 @@ bind_address() {
     # deprecated 避免抢占首选源地址。noprefixroute 保留原有前缀路由策略。
     if ! ip -6 addr add "$address/$mask" dev "$device" preferred_lft 0 noprefixroute; then
         recover_pending || return 1
-        [[ ${live["$device/$address/$mask"]+yes} ]]
+        [[ $mode != fresh && ${live[$key]+yes} ]]
         return
     fi
+    if ! lookup_binding "$address" || ! proof=$(binding_proof "$address"); then
+        error "无法记录 $address 的内核绑定归属，保留绑定供检查。"
+        return 1
+    fi
+    proofs[$address]=$proof
     owned[$address]=1
-    write_file "$OWNED" "${!owned[@]}" && rm -f "$PENDING"
+    save_proofs && write_file "$OWNED" "${!owned[@]}" && rm -f "$PENDING"
 }
 
 wait_for_dad() {
     local attempt address details pending
+    local -a conflicts=()
+    dad_failed=()
     for ((attempt=0; attempt<=10; attempt++)); do
         scan_addresses || return 1
         pending=0
-        for address in "${pool[@]}"; do
+        conflicts=()
+        for address in "$@"; do
             details=${live["$device/$address/$mask"]-}
-            if [[ -z $details || $details == *' dadfailed '* ]]; then
-                error "地址 $address 未绑定或重复地址检测失败。"
+            if [[ -z $details ]]; then
+                error "地址 $address 未绑定。"
                 return 1
             fi
-            if [[ $details == *' tentative '* ]]; then pending=1; fi
+            if [[ $details == *' dadfailed '* ]]; then conflicts+=("$address")
+            elif [[ $details == *' tentative '* ]]; then pending=1; fi
         done
-        (( pending )) || return 0
+        if (( ! pending )); then
+            dad_failed=("${conflicts[@]}")
+            (( ! ${#dad_failed[@]} ))
+            return
+        fi
         if (( attempt < 10 )); then sleep 1; fi
     done
     error '等待 IPv6 重复地址检测超时。'
     return 1
 }
 
-reconcile() {
+prune_owned() {
     local address
-    recover_pending || return 1
     for address in "${!owned[@]}"; do
         if [[ ! ${wanted[$address]+yes} ]]; then remove_owned "$address" || return 1; fi
     done
+}
+
+reconcile() {
+    local address
+    recover_pending && prune_owned || return 1
     (( ${#pool[@]} )) || return 0
     scan_addresses || return 1
     for address in "${pool[@]}"; do bind_address "$address" || return 1; done
-    wait_for_dad
+    if wait_for_dad "${pool[@]}"; then return 0; fi
+    for address in "${dad_failed[@]}"; do error "地址 $address 重复地址检测失败。排除冲突后恢复，或选 3 更换地址池。"; done
+    return 1
 }
 
-make_pool() {
-    local count=$1 address suffix attempt
-    local -a bytes next=()
-    local -A chosen=()
-    for ((attempt=0; attempt<count*20 && ${#next[@]}<count; attempt++)); do
-        bytes=()
-        read -r -a bytes <<< "$(od -An -v -tx1 -N8 /dev/urandom)"
-        [[ ${bytes[*]} =~ ^[0-9a-f]{2}(\ [0-9a-f]{2}){7}$ ]] || return 1
-        printf -v suffix '%s%s:%s%s:%s%s:%s%s' "${bytes[@]}"
-        address=$prefix:$suffix
-        valid_pool_ip "$address" || continue
-        if [[ ${present[$address]+yes} || ${protected[$address]+yes} || ${wanted[$address]+yes} ||
-            ${owned[$address]+yes} || ${chosen[$address]+yes} ]]; then continue; fi
-        next+=("$address")
-        chosen[$address]=1
+stage_pool() {
+    local count=$1 address suffix attempt round
+    local -a bytes ready
+    local -A tried=() failed=()
+    next_pool=()
+    scan_addresses || return 1
+    for ((round=0; round<4; round++)); do
+        for ((attempt=0; attempt<count*20 && ${#next_pool[@]}<count; attempt++)); do
+            read -r -a bytes <<< "$(od -An -v -tx1 -N8 /dev/urandom)"
+            [[ ${bytes[*]} =~ ^[0-9a-f]{2}(\ [0-9a-f]{2}){7}$ ]] || return 1
+            printf -v suffix '%s%s:%s%s:%s%s:%s%s' "${bytes[@]}"
+            address=$prefix:$suffix
+            valid_pool_ip "$address" || continue
+            if [[ ${present[$address]+yes} || ${protected[$address]+yes} || ${wanted[$address]+yes} ||
+                ${owned[$address]+yes} || ${tried[$address]+yes} ]]; then continue; fi
+            tried[$address]=1
+            bind_address "$address" fresh || return 1
+            next_pool+=("$address")
+        done
+        (( ${#next_pool[@]} == count )) || return 1
+        if wait_for_dad "${next_pool[@]}"; then return 0; fi
+        (( ${#dad_failed[@]} )) || return 1
+        for address in "${dad_failed[@]}"; do
+            error "候选地址 $address 发生重复地址冲突，将补抽新地址。"
+            remove_owned "$address" || return 1
+            failed[$address]=1
+        done
+        ready=()
+        for address in "${next_pool[@]}"; do
+            if [[ ! ${failed[$address]+yes} ]]; then ready+=("$address"); fi
+        done
+        next_pool=("${ready[@]}")
     done
-    (( ${#next[@]} == count )) || return 1
-    write_file "$IPS" "${next[@]}" && read_state
+    error '多次补抽仍有地址发生冲突。'
+    return 1
 }
 
 has_hook() { [[ -f $1 && ! -L $1 ]] && grep -Fqx "$MARK" "$1"; }
@@ -419,9 +564,11 @@ edit_rc_local() {
 
 remove_systemd() {
     has_hook "$UNIT" || return 0
-    if is_systemd; then systemctl disable ipv6-pool-restore.service || return 1; fi
+    if is_systemd; then systemctl disable ipv6-pool-restore.service --no-reload || return 1; fi
     rm -f "$UNIT" || return 1
-    if is_systemd; then systemctl daemon-reload; fi
+    if is_systemd && ! systemctl daemon-reload; then
+        error 'systemd 服务已从磁盘移除。当前管理器未能重载配置。'
+    fi
 }
 
 install_boot() {
@@ -462,7 +609,7 @@ decode_base64() {
 }
 
 vmess_links() {
-    local address addresses=''
+    local address address_lines=''
     if has python3; then
         decode_base64 "$vmess_payload" | python3 -c '
 import base64, json, re, sys
@@ -471,6 +618,9 @@ if (not isinstance(profile, dict) or not isinstance(profile.get("add"), str)
         or not profile["add"] or not isinstance(profile.get("ps"), (str, type(None)))):
     sys.exit(1)
 name = re.sub(sys.argv[1] + r"\Z", "", profile.get("ps") or "")
+if (profile.get("tls") in ("tls", "reality") and not profile.get("sni")
+        and not profile.get("host")):
+    profile["sni"] = profile["add"].strip("[]")
 for index, address in enumerate(sys.argv[2:], 1):
     profile["add"] = address
     profile["ps"] = (name + "-" if name else "") + "v6-{:02d}".format(index)
@@ -478,12 +628,14 @@ for index, address in enumerate(sys.argv[2:], 1):
     print("vmess://" + base64.b64encode(data.encode("utf-8")).decode("ascii"))
 ' "$V6_NAME_SUFFIX" "$@"
     else
-        for address in "$@"; do addresses+="$address"$'\n'; done
-        decode_base64 "$vmess_payload" | jq -scr --arg addresses "$addresses" --arg suffix "$V6_NAME_SUFFIX" '
+        for address in "$@"; do address_lines+="$address"$'\n'; done
+        decode_base64 "$vmess_payload" | jq -scr --arg addresses "$address_lines" --arg suffix "$V6_NAME_SUFFIX" '
             if length != 1 then error("expected one object") else .[0] end |
             if type != "object" or (.add | type != "string" or length == 0)
                or ((.ps // "") | type != "string") or .ps == false
             then error("invalid profile") else . end |
+            if (.tls == "tls" or .tls == "reality") and ((.sni // "") == "") and ((.host // "") == "")
+            then .sni = (.add | sub("^\\["; "") | sub("\\]$"; "")) else . end |
             . as $profile |
             ((.ps // "") | sub($suffix + "\\z"; "") | if length == 0 then "" else . + "-" end) as $name |
             ($addresses | split("\n") | map(select(length > 0)) | to_entries[]) as $entry |
@@ -493,6 +645,24 @@ for index, address in enumerate(sys.argv[2:], 1):
             "vmess://" + (tojson | @base64)
         '
     fi
+}
+
+valid_hysteria_ports() {
+    local range first last
+    local -a ranges
+    [[ $1 =~ ^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$ ]] || return 1
+    IFS=, read -r -a ranges <<< "$1"
+    for range in "${ranges[@]}"; do
+        first=${range%-*}
+        last=${range##*-}
+        (( 10#$first >= 1 && 10#$first <= 10#$last && 10#$last <= 65535 )) || return 1
+    done
+}
+
+append_link_parameter() {
+    if [[ $link_tail != *\?* ]]; then link_tail+='?'
+    elif [[ -n ${link_tail#*\?} && $link_tail != *\& ]]; then link_tail+='&'; fi
+    link_tail+="$1=$2"
 }
 
 # 换掉连接地址时，保留原先隐式使用的 TLS 校验名称。
@@ -508,14 +678,12 @@ preserve_tls_name() {
         replacement="${BASH_REMATCH[1]}${BASH_REMATCH[2]}=$name${BASH_REMATCH[3]}"
         link_tail="${link_tail%%\?*}?${query/"$empty_sni"/"$replacement"}"
     else
-        if [[ $link_tail != *\?* ]]; then link_tail+='?'
-        elif [[ -n $query && $query != *\& ]]; then link_tail+='&'; fi
-        link_tail+="sni=$name"
+        append_link_parameter sni "$name"
     fi
 }
 
 parse_link() {
-    local link=$1 body authority endpoint host after expanded
+    local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter
     link_scheme=${link%%://*}
     body=${link#*://}
     [[ $link != "$body" && -n $body && ! $link =~ [[:space:][:cntrl:]] ]] || return 1
@@ -540,7 +708,7 @@ parse_link() {
         [[ $link_auth == *:* && -n ${link_auth%%:*} && -n ${link_auth#*:} ]] || return 1
     fi
     if [[ $endpoint == \[* ]]; then
-        [[ $endpoint =~ ^\[([^]]+)\](:([0-9]{1,5}))?$ ]] || return 1
+        [[ $endpoint =~ ^\[([^]]+)\](:([^:]+))?$ ]] || return 1
         host=${BASH_REMATCH[1]}
         link_port=${BASH_REMATCH[3]}
         if [[ $host == *%25* ]]; then
@@ -549,17 +717,46 @@ parse_link() {
         fi
         expand_ipv6 "$host" || return 1
     else
-        [[ $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*)(:([0-9]{1,5}))?$ ]] || return 1
+        [[ $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*)(:([^:]+))?$ ]] || return 1
         host=${BASH_REMATCH[1]}
         link_port=${BASH_REMATCH[3]}
         if [[ $host =~ ^[0-9.]+$ && $host == *.* ]]; then ipv4_valid "$host" || return 1; fi
     fi
-    if [[ -z $link_port && $link_scheme == anytls ]]; then link_port=443; fi
-    [[ -n $link_port ]] || return 1
-    (( 10#$link_port >= 1 && 10#$link_port <= 65535 )) || return 1
+    case $link_scheme in
+        hysteria2|hy2) link_port=${link_port:-443}; valid_hysteria_ports "$link_port" || return 1 ;;
+        *)
+            if [[ $link_scheme == anytls ]]; then link_port=${link_port:-443}; fi
+            [[ $link_port =~ ^[0-9]{1,5}$ ]] &&
+                (( 10#$link_port >= 1 && 10#$link_port <= 65535 )) || return 1
+            ;;
+    esac
     after=${body#"$authority"}
     link_tail=${after%%#*}
-    if [[ $link_scheme == anytls || $link_scheme == tuic ]]; then preserve_tls_name "$host"; fi
+    if [[ $link_tail == *\?* ]]; then query=${link_tail#*\?}; fi
+    case $link_scheme in
+        hysteria2|hy2)
+            # v2rayN/NG 需要主机后的单个端口，跳跃端口通过 mport 传递。
+            if [[ $link_port == *[,-]* ]]; then
+                ports=${link_port//,/%2C}
+                link_port=${link_port%%[,-]*}
+                if [[ $query =~ (^|\&)mport=[^\&]* ]]; then
+                    old_parameter=${BASH_REMATCH[0]}
+                    link_tail="${link_tail%%\?*}?${query/"$old_parameter"/"${BASH_REMATCH[1]}mport=$ports"}"
+                else
+                    append_link_parameter mport "$ports"
+                fi
+            fi
+            preserve_tls_name "$host"
+            ;;
+        anytls|tuic) preserve_tls_name "$host" ;;
+        trojan|vless)
+            if [[ $query =~ (^|\&)security=([^\&]*) ]]; then security=${BASH_REMATCH[2]}; fi
+            if [[ ( $security == tls || $security == reality || ( $link_scheme == trojan && -z $security ) ) &&
+                ! $query =~ (^|\&)(host|authority)=[^\&]+ ]]; then
+                preserve_tls_name "$host"
+            fi
+            ;;
+    esac
     link_name=''
     if [[ $after == *'#'* ]]; then link_name=${after#*#}; fi
     if [[ $link_name =~ ${V6_NAME_SUFFIX}$ ]]; then link_name=${link_name%"${BASH_REMATCH[0]}"}; fi
@@ -591,43 +788,76 @@ print_import_line() {
         '--------------------' "$encoded" '--------------------'
 }
 
-emit_nodes() {
-    local link result address serial name index=0
-    local -a links=()
+read_node_link() {
+    local link result
     while read -r -p '粘贴一条原节点链接（回车取消）：' link; do
         link=${link%$'\r'}
-        [[ -n $link ]] || return 0
+        [[ -n $link ]] || return 1
         parse_link "$link"
         result=$?
-        if (( result == 0 )); then
-            if [[ $link_scheme == vmess ]]; then
-                result=$(vmess_links "${pool[@]}") || { error 'VMess 转换失败，请检查链接。'; continue; }
-                mapfile -t links <<< "$result"
-            else
-                for address in "${pool[@]}"; do
-                    printf -v serial 'v6-%02d' "$((++index))"
-                    name=${link_name:+$link_name-}$serial
-                    links+=("$link_scheme://$link_auth@[$address]:$link_port$link_tail#$name")
-                done
-            fi
-            (( ${#links[@]} == ${#pool[@]} )) && write_file "$NODES" "${links[@]}" || return 1
-            print_import_line || return 1
-            info "已保存到 $NODES。请确保防火墙已放行对应端口的 IPv6 流量。"
-            return 0
-        fi
+        if (( result == 0 )); then return 0; fi
         if (( result != 2 )); then error '链接无效，请检查协议、凭据、地址和端口后重新粘贴。'; fi
     done
+    return 1
+}
+
+build_links() {
+    local address serial name index=0
+    if [[ $link_scheme == vmess ]]; then
+        vmess_links "$@"
+        return
+    fi
+    for address in "$@"; do
+        printf -v serial 'v6-%02d' "$((++index))"
+        name=${link_name:+$link_name-}$serial
+        printf '%s\n' "$link_scheme://$link_auth@[$address]:$link_port$link_tail#$name"
+    done
+}
+
+show_result() {
+    print_import_line || return 1
+    info "已保存到 $NODES。请确保防火墙已放行对应端口的 IPv6 流量。"
+}
+
+prepare_pool_commit() {
+    local count=$1 result index
+    local -a links=() records=()
+    stage_pool "$count" || return 1
+    result=$(build_links "${next_pool[@]}") || return 1
+    mapfile -t links <<< "$result"
+    (( ${#links[@]} == ${#next_pool[@]} )) || return 1
+    for index in "${!next_pool[@]}"; do
+        records+=("${next_pool[index]}"$'\t'"${links[index]}")
+    done
+    install_boot && write_file "$TRANSITION" "${records[@]}"
 }
 
 generate() {
     local count
-    check_network && ask_count && init_pool && make_pool "$count" &&
-        reconcile && install_boot && emit_nodes
+    check_network || return 1
+    if ! ask_count || ! read_node_link; then return 0; fi
+    init_pool && recover_pending && prune_owned || return 1
+    if ! prepare_pool_commit "$count"; then
+        if ! read_state || ! recover_pending || ! prune_owned; then
+            error '候选地址未能完全清理，重新运行后可继续清理。'
+        fi
+        return 1
+    fi
+    finish_transition || return 1
+    if ! prune_owned; then error '新地址池已保存，部分旧托管地址等待清理。'; fi
+    show_result
 }
 
 reuse_pool() {
+    local result
+    local -a links=()
     if (( ! ${#pool[@]} )); then error '还没有可复用的 IPv6 地址池。'; return 1; fi
-    check_network && reconcile && install_boot && emit_nodes
+    check_network || return 1
+    read_node_link || return 0
+    result=$(build_links "${pool[@]}") || return 1
+    mapfile -t links <<< "$result"
+    (( ${#links[@]} == ${#pool[@]} )) || return 1
+    reconcile && install_boot && write_file "$NODES" "${links[@]}" && show_result
 }
 
 cleanup() {
@@ -636,7 +866,7 @@ cleanup() {
     fi
     remove_boot || return 1
     local path
-    for path in "$OWNED" "$IPS" "$PENDING" "$CONFIG" "$PROTECTED" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
+    for path in "$OWNED" "$IPS" "$PROOFS" "$PENDING" "$TRANSITION" "$CONFIG" "$PROTECTED" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
         rm -f "$path" "$path.new" || return 1
     done
     rmdir "$STATE" || return 1
@@ -646,7 +876,7 @@ cleanup() {
 menu() {
     local choice shown_prefix shown_mask
     while :; do
-        read_state || die '状态文件无效，停止操作。'
+        if ! read_state || ! finish_transition; then die '无法载入地址池状态。'; fi
         detect_network || :
         shown_prefix=${prefix:-$detected_prefix}
         shown_mask=${mask:-$detected_mask}
@@ -691,6 +921,9 @@ main() {
         has "$command" || die "缺少基础命令 $command。"
     done
     if ! has flock; then die '需要 flock 锁定地址池。Alpine 可运行 apk add flock。'; fi
+    if ! read -r boot_id < /proc/sys/kernel/random/boot_id || [[ ! $boot_id =~ ^[0-9a-f-]{36}$ ]]; then
+        die '无法读取 Linux 启动 ID。'
+    fi
     if [[ $mode == --restore && ! -e $STATE ]]; then return 0; fi
     [[ ! -L $STATE ]] || die '状态目录不能是符号链接。'
     if ! mkdir -p "$STATE" || [[ ! -d $STATE || ! -O $STATE ]] || ! chmod 700 "$STATE"; then
@@ -698,12 +931,12 @@ main() {
     fi
     exec 9< "$STATE" || die '无法打开状态目录。'
     flock -n 9 || die '已有另一个实例在操作地址池。'
-    for file in "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PENDING" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
+    for file in "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS" "$PENDING" "$TRANSITION" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
         [[ ! -L $file && ! -L $file.new && ( ! -e $file || ( -f $file && -O $file ) ) &&
             ( ! -e $file.new || ( -f $file.new && -O $file.new ) ) ]] || die "状态文件不安全：$file"
     done
     if [[ $mode == --restore ]]; then
-        read_state || die '状态文件无效，停止恢复。'
+        if ! read_state || ! finish_transition; then die '无法载入地址池状态，停止恢复。'; fi
         [[ -n $device ]] || return 0
         if (( ${#pool[@]} )); then
             for ((attempt=0; attempt<15; attempt++)); do
