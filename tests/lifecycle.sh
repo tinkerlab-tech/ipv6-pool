@@ -128,6 +128,16 @@ run 2 'trojan://secret%40test@example.test:0443?x=a/b+c%26#already-v6-v6-02' 0 >
 grep -Fxq "trojan://secret%40test@[${old[0]}]:0443?x=a/b+c%26#already-v6-01" "$state/nodes.txt"
 run 2 'hy2://secret@[::ffff:192.0.2.1]:8443?sni=example.test&obfs-password=A%2BB#v6-01' 0 > /run/reused
 grep -Fxq "hy2://secret@[${old[0]}]:8443?sni=example.test&obfs-password=A%2BB#v6-01" "$state/nodes.txt"
+run 2 'anytls://secret%3A%40@example.test/?insecure=0&vendor=q%3D%2B#AnyTLS' 0 > /run/reused
+grep -Fxq "anytls://secret%3A%40@[${old[0]}]:443/?insecure=0&vendor=q%3D%2B&sni=example.test#AnyTLS-v6-01" "$state/nodes.txt"
+run 2 'anytls://secret@198.51.100.1:8443?sni=&peer=tls.example.test&insecure=0#AnyTLS' 0 > /run/reused
+grep -Fxq "anytls://secret@[${old[0]}]:8443?sni=tls.example.test&peer=tls.example.test&insecure=0#AnyTLS-v6-01" "$state/nodes.txt"
+run 2 'anytls://secret@[2001:db8::1]#AnyTLS' 0 > /run/reused
+grep -Fxq "anytls://secret@[${old[0]}]:443?sni=2001%3Adb8%3A%3A1#AnyTLS-v6-01" "$state/nodes.txt"
+run 2 'tuic://00000000-0000-4000-8000-000000000001:secret%40test@[2001:db8::1]:8443/?congestion_control=bbr&alpn=h3&udp_relay_mode=native&sni=tls.example.test#TUIC' 0 > /run/reused
+grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret%40test@[${old[0]}]:8443/?congestion_control=bbr&alpn=h3&udp_relay_mode=native&sni=tls.example.test#TUIC-v6-01" "$state/nodes.txt"
+run 2 'tuic://00000000-0000-4000-8000-000000000001:secret@example.test:443?vendor=q?#TUIC' 0 > /run/reused
+grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret@[${old[0]}]:443?vendor=q?&sni=example.test#TUIC-v6-01" "$state/nodes.txt"
 
 if command -v python3 >/dev/null; then
     vmess='{"v":"2","add":"example.test","port":"443","id":"test","ps":"a/b+c-v6-prod-v6-100","sni":"example.test","extra":{"nested":true}}'

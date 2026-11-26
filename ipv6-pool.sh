@@ -495,6 +495,25 @@ for index, address in enumerate(sys.argv[2:], 1):
     fi
 }
 
+# 换掉连接地址时，保留原先隐式使用的 TLS 校验名称。
+preserve_tls_name() {
+    local host=$1 query='' name empty_sni replacement
+    if [[ $link_tail == *\?* ]]; then query=${link_tail#*\?}; fi
+    if [[ $query =~ (^|\&)[Ss][Nn][Ii]=[^\&]+ ]]; then return 0; fi
+
+    name=${host//:/%3A}
+    if [[ $query =~ (^|\&)[Pp][Ee][Ee][Rr]=([^\&]+) ]]; then name=${BASH_REMATCH[2]}; fi
+    if [[ $query =~ (^|\&)([Ss][Nn][Ii])=($|\&) ]]; then
+        empty_sni=${BASH_REMATCH[0]}
+        replacement="${BASH_REMATCH[1]}${BASH_REMATCH[2]}=$name${BASH_REMATCH[3]}"
+        link_tail="${link_tail%%\?*}?${query/"$empty_sni"/"$replacement"}"
+    else
+        if [[ $link_tail != *\?* ]]; then link_tail+='?'
+        elif [[ -n $query && $query != *\& ]]; then link_tail+='&'; fi
+        link_tail+="sni=$name"
+    fi
+}
+
 parse_link() {
     local link=$1 body authority endpoint host after expanded
     link_scheme=${link%%://*}
@@ -510,31 +529,37 @@ parse_link() {
             vmess_links >/dev/null 2>&1
             return
             ;;
-        vless|trojan|hysteria2|hy2|ss) ;;
+        vless|trojan|hysteria2|hy2|ss|anytls|tuic) ;;
         *) return 1 ;;
     esac
     authority=${body%%[/?#]*}
     link_auth=${authority%@*}
     endpoint=${authority##*@}
     [[ -n $link_auth && $authority == *@* && $link_auth != *@* ]] || return 1
+    if [[ $link_scheme == tuic ]]; then
+        [[ $link_auth == *:* && -n ${link_auth%%:*} && -n ${link_auth#*:} ]] || return 1
+    fi
     if [[ $endpoint == \[* ]]; then
-        [[ $endpoint =~ ^\[([^]]+)\]:([0-9]{1,5})$ ]] || return 1
+        [[ $endpoint =~ ^\[([^]]+)\](:([0-9]{1,5}))?$ ]] || return 1
         host=${BASH_REMATCH[1]}
-        link_port=${BASH_REMATCH[2]}
+        link_port=${BASH_REMATCH[3]}
         if [[ $host == *%25* ]]; then
             [[ ${host#*%25} =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
             host=${host%%\%25*}
         fi
         expand_ipv6 "$host" || return 1
     else
-        [[ $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*):([0-9]{1,5})$ ]] || return 1
+        [[ $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*)(:([0-9]{1,5}))?$ ]] || return 1
         host=${BASH_REMATCH[1]}
-        link_port=${BASH_REMATCH[2]}
+        link_port=${BASH_REMATCH[3]}
         if [[ $host =~ ^[0-9.]+$ && $host == *.* ]]; then ipv4_valid "$host" || return 1; fi
     fi
+    if [[ -z $link_port && $link_scheme == anytls ]]; then link_port=443; fi
+    [[ -n $link_port ]] || return 1
     (( 10#$link_port >= 1 && 10#$link_port <= 65535 )) || return 1
     after=${body#"$authority"}
     link_tail=${after%%#*}
+    if [[ $link_scheme == anytls || $link_scheme == tuic ]]; then preserve_tls_name "$host"; fi
     link_name=''
     if [[ $after == *'#'* ]]; then link_name=${after#*#}; fi
     if [[ $link_name =~ ${V6_NAME_SUFFIX}$ ]]; then link_name=${link_name%"${BASH_REMATCH[0]}"}; fi
