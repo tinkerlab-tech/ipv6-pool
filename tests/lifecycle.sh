@@ -127,7 +127,9 @@ esac
 
 ip -6 addr del "${old[0]}/64" dev "$dev"
 "$state/ipv6-pool.sh" --restore
-"$state/ipv6-pool.sh" --restore
+# RHEL 系列可能通过名为 sh 的 Bash 启动开机恢复脚本。
+ln -s "$(command -v bash)" /run/bin/sh
+/run/bin/sh "$state/ipv6-pool.sh" --restore
 test_ip "${old[0]}" 128
 test_ip "${old[1]}" 128
 

@@ -54,8 +54,15 @@ jobs:
             --env PACKAGES --env BACKEND "$IMAGE" sh -euc '
               case "$PACKAGES" in
                 apt)
-                  apt-get -qq update
-                  DEBIAN_FRONTEND=noninteractive apt-get -yq install --no-install-recommends \
+                  . /etc/os-release
+                  set --
+                  if [ "${VERSION_CODENAME:-}" = bullseye ]; then
+                    # Use the signed main repo for the Debian 11 fixture.
+                    printf "%s\n" "deb http://deb.debian.org/debian bullseye main" > /tmp/ipv6-pool.list
+                    set -- -o Dir::Etc::sourcelist=/tmp/ipv6-pool.list -o Dir::Etc::sourceparts=-
+                  fi
+                  apt-get "$@" -qq update
+                  DEBIAN_FRONTEND=noninteractive apt-get "$@" -yq install --no-install-recommends \
                     bash iproute2 util-linux coreutils grep mawk diffutils python3
                   ;;
                 dnf)

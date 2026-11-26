@@ -6,6 +6,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exit 1
 fi
 
+# /bin/sh 在部分发行版上是 Bash，此时要退出其 POSIX 兼容模式。
+set +o posix
 set +x
 set -o pipefail
 export LC_ALL=C
