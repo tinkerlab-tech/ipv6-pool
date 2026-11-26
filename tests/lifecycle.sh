@@ -186,6 +186,42 @@ assert actual == expected
 PY
 fi
 
+if command -v jq >/dev/null; then
+    mkdir -p /run/jq-bin
+    for tool in ip flock awk grep od base64 tr chmod cp mv rm mkdir rmdir cat sleep jq systemctl rc-update; do
+        if tool_path=$(command -v "$tool" 2>/dev/null); then
+            ln -sf "$tool_path" "/run/jq-bin/$tool"
+        fi
+    done
+    vmess_int='{"v":"2","add":"example.test","port":443,"id":"test","ps":"jq-v6-02","tls":"tls","extra":{"nested":true}}'
+    encoded_int=$(printf '%s' "$vmess_int" | base64 | tr -d '\n')
+    bad_vmess_port=$(printf '%s' '{"v":"2","add":"example.test","port":true,"id":"test"}' | base64 | tr -d '\n')
+    vmess_zero_port='{"v":"2","add":"example.test","port":"0443","id":"test","ps":"zero"}'
+    encoded_zero=$(printf '%s' "$vmess_zero_port" | base64 | tr -d '\n')
+    printf '%s\n' 2 "vmess://uuid@example.test:443" "vmess://$bad_vmess_port" "vmess://$encoded_int" 0 |
+        PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+    grep -Fq 'Base64 JSON' /run/reused
+    grep -Fq 'VMess 链接无效' /run/reused
+    if command -v python3 >/dev/null; then
+        python3 - "$state/nodes.txt" "${old[0]}" "$vmess_int" <<'PY'
+import base64, json, sys
+with open(sys.argv[1], encoding="ascii") as nodes:
+    line = nodes.readline().strip()
+    assert line.startswith("vmess://")
+    actual = json.loads(base64.b64decode(line[len("vmess://"):]))
+expected = json.loads(sys.argv[3])
+expected.update(add=sys.argv[2], ps="jq-v6-01", sni="example.test")
+assert actual == expected
+PY
+    fi
+    printf '%s\n' 2 "vmess://$encoded_zero" 0 | PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+    grep -Fq 'vmess://' "$state/nodes.txt"
+    rm -f /run/jq-bin/jq
+    printf '%s\n' 2 "vmess://$encoded_int" '' 0 | PATH=/run/jq-bin bash "$script" > /run/reused 2>&1
+    grep -Fq 'VMess 需要 python3 或 jq' /run/reused
+    rm -rf /run/jq-bin
+fi
+
 # 人工接管地址后，洗牌只清除仍符合脚本绑定属性的地址。
 ip -6 addr change "${old[0]}/64" dev "$dev" preferred_lft forever noprefixroute
 ip -6 route del default dev "$dev"
@@ -207,8 +243,18 @@ case $backend in
     openrc) [[ ! -e $hook ]] ;;
 esac
 
-# /48 保留原生地址所在的 /64，绑定时沿用 /48 掩码。
+# /56 与 /48 均保留原生地址所在的 /64，绑定时沿用原掩码。
 ip -6 addr del "$native/64" dev "$dev"
+ip -6 addr add 2402:1920:0:5600::2/56 dev "$dev" nodad
+run 1 1 "$original" 0 > /run/subnet48
+grep -Fq '掩码 /56' /run/subnet48
+read -r address < "$state/ips.list"
+[[ $address == 2402:1920:0000:5600:* ]]
+ip -o -6 addr show dev "$dev" to "$address/128" | grep -Fq '/56'
+run 5 > /run/removed
+[[ ! -e $state ]]
+ip -6 addr del 2402:1920:0:5600::2/56 dev "$dev"
+
 ip -6 addr add 2402:1920:0:1234::2/48 dev "$dev" nodad
 run 1 2 "$original" 0 > /run/subnet48
 read -r address < "$state/ips.list"

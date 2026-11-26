@@ -26,7 +26,7 @@ wget -O /root/ipv6-pool.sh "https://raw.githubusercontent.com/tinkerlab-tech/ipv
 
 ## 使用条件
 
-- VPS 的 IPv6 默认出口网卡需要有可用的全局单播 IPv6，地址掩码为 `/64` 或 `/48`。使用 `/48` 时，生成地址位于原生地址所在的 `/64` 子网内，绑定沿用 `/48`。
+- VPS 的 IPv6 默认出口网卡需要有可用的全局单播 IPv6，地址掩码为 `/48` 至 `/64`（如 `/64`、`/56`、`/48`）。掩码小于 `/64` 时，生成地址位于原生地址所在的 `/64` 子网内，绑定沿用原掩码。
 - VPS 商家需将对应 IPv6 地址路由到你的实例。节点服务应监听 IPv6，系统和商家防火墙都需放行对应端口及传输协议。
 - 需要 Bash 4.2+、完整版 `iproute2`、`flock` 和常见系统命令。Alpine 可运行 `apk add bash iproute2`，缺少 `flock` 时运行 `apk add flock`。下载命令使用 `curl` 或 `wget`，也可以直接上传 `ipv6-pool.sh`。
 - 原生支持 VLESS、Trojan、Hysteria 2（`hysteria2://` 和 `hy2://`）、Shadowsocks SIP002、AnyTLS（`anytls://`）和 TUIC v5（`tuic://`）。VMess 需要 `python3` 或 `jq`。

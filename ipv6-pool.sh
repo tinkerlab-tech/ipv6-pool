@@ -108,7 +108,7 @@ expand_ipv6() {
 }
 
 valid_device() { [[ $1 =~ ^[A-Za-z0-9_.-]{1,15}$ && $1 != -* ]]; }
-valid_mask() { [[ $1 == 48 || $1 == 64 ]]; }
+valid_mask() { [[ $1 =~ ^(4[89]|5[0-9]|6[0-4])$ ]]; }
 
 valid_pool_ip() {
     local address=$1 suffix
@@ -243,7 +243,7 @@ detect_network() {
         fi
     done <<< "$address_snapshot"
     if [[ -n $first_mask ]]; then
-        detection_error="网卡 $route_dev 的原生 IPv6 掩码为 /${first_mask}，仅支持 /64 或 /48。"
+        detection_error="网卡 $route_dev 的原生 IPv6 掩码为 /${first_mask}，仅支持 /48 至 /64。"
     else
         detection_error="网卡 $route_dev 没有可用的原生全局单播 IPv6。"
     fi
@@ -991,8 +991,8 @@ menu() {
         shown_prefix=${prefix:-$detected_prefix}
         shown_mask=${mask:-$detected_mask}
         if [[ -n $shown_prefix ]]; then
-            if [[ $shown_mask == 48 ]]; then shown_prefix+='::/64（掩码 /48）'
-            else shown_prefix+="::/$shown_mask"; fi
+            if [[ $shown_mask != 64 ]]; then shown_prefix+="::/64（掩码 /$shown_mask）"
+            else shown_prefix+='::/64'; fi
         else
             shown_prefix=未检测到
         fi
