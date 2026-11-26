@@ -56,11 +56,11 @@ jobs:
                 apt)
                   apt-get -qq update
                   DEBIAN_FRONTEND=noninteractive apt-get -yq install --no-install-recommends \
-                    bash iproute2 util-linux coreutils grep awk python3
+                    bash iproute2 util-linux coreutils grep mawk diffutils python3
                   ;;
                 dnf)
                   dnf -y install --setopt=install_weak_deps=False \
-                    bash iproute util-linux grep gawk python3
+                    bash iproute util-linux grep gawk diffutils python3
                   ;;
                 apk)
                   apk add --no-cache bash iproute2 flock util-linux-misc python3
