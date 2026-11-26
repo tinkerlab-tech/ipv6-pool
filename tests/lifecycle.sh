@@ -83,7 +83,10 @@ original='vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@[2400::1]:443?security=re
 run 1 0 101 2 'trojan://user@example.test:99999' "$original" 4 0 > /run/first 2>&1
 [[ $(wc -l < "$state/ips.list") -eq 2 && $(wc -l < "$state/nodes.txt") -eq 2 ]]
 [[ $(stat -c '%a' "$state/nodes.txt") == 600 ]]
-[[ $(grep -c 'vless://' /run/first) -eq 4 ]]
+[[ $(grep -c 'vless://' /run/first) -eq 2 ]]
+mapfile -t imports < <(grep -E '^[A-Za-z0-9+/]+={0,2}$' /run/first)
+[[ ${#imports[@]} -eq 2 && ${imports[0]} == "${imports[1]}" ]]
+printf '%s' "${imports[0]}" | base64 -d | cmp - "$state/nodes.txt"
 mapfile -t old < "$state/ips.list"
 mapfile -t links < "$state/nodes.txt"
 [[ ${old[0]} == 2402:1920:0000:0000:0000:0000:0000:1234 ]]

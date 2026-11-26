@@ -30,7 +30,7 @@ device='' prefix='' mask=''
 detected_dev='' detected_prefix='' detected_mask='' detection_error=''
 address_snapshot='' routes=''
 
-info() { printf '%s\n' "$*"; }
+info() { printf '%s\n' "$@"; }
 error() { printf 'IPv6 节点池：%s\n' "$*" >&2; }
 die() { error "$@"; exit 1; }
 has() { command -v "$1" >/dev/null 2>&1; }
@@ -555,6 +555,13 @@ print_nodes() {
     info '--------------------'
 }
 
+print_import_line() {
+    local encoded
+    encoded=$(base64 < "$NODES" | tr -d '\n') || return 1
+    info 'v2rayN 单行导入串。复制分割线之间的全部字符，再到 v2rayN 主界面按 Ctrl+V。' \
+        '--------------------' "$encoded" '--------------------'
+}
+
 emit_nodes() {
     local link result address serial name index=0
     local -a links=()
@@ -575,7 +582,7 @@ emit_nodes() {
                 done
             fi
             (( ${#links[@]} == ${#pool[@]} )) && write_file "$NODES" "${links[@]}" || return 1
-            print_nodes || return 1
+            print_import_line || return 1
             info "已保存到 $NODES。请确保防火墙已放行对应端口的 IPv6 流量。"
             return 0
         fi
@@ -621,14 +628,15 @@ menu() {
             error "$detection_error"
         fi
         info '1. 一键生成 IPv6 池并裂变节点' '2. 复用现有 IPv6 池重新裂变' \
-            '3. 一键洗牌换血' '4. 查看历史生成的节点链接' '5. 一键清理并彻底卸载' '0. 退出'
+            '3. 一键洗牌换血' '4. 查看历史链接与单行导入串' '5. 一键清理并彻底卸载' '0. 退出'
         read -r -p '选择操作：' choice || return 0
         case $choice in
             1) if (( ${#pool[@]} )); then error '现有地址池可通过选项 2 复用，或通过选项 3 更换。'
                else generate || error '生成未完成，可在菜单中继续操作。'; fi ;;
             2) reuse_pool || error '复用未完成。' ;;
             3) generate || error '洗牌未完成，可在菜单中继续操作。' ;;
-            4) if [[ -s $NODES ]]; then print_nodes; else info '暂无历史节点链接。'; fi ;;
+            4) if [[ ! -s $NODES ]]; then info '暂无历史节点链接。'
+               elif ! print_nodes || ! print_import_line; then error '读取历史节点链接失败。'; fi ;;
             5) if cleanup; then return 0; else error '清理未完成，可以重试。'; fi ;;
             0) return 0 ;;
             *) error '请选择 0 到 5。' ;;
@@ -650,7 +658,7 @@ main() {
     version=$(ip -V 2>&1) || version=''
     [[ $version == *iproute2* ]] ||
         die '需要完整版 iproute2。Alpine 可运行 apk add bash iproute2。'
-    for command in awk grep od base64 chmod cp mv rm mkdir rmdir cat sleep; do
+    for command in awk grep od base64 tr chmod cp mv rm mkdir rmdir cat sleep; do
         has "$command" || die "缺少基础命令 $command。"
     done
     if ! has flock; then die '需要 flock 锁定地址池。Alpine 可运行 apk add flock。'; fi
