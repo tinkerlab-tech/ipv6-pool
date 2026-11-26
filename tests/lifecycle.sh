@@ -80,7 +80,7 @@ OD
 chmod +x /run/bin/od
 
 original='vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@[2400::1]:443?security=reality&sni=example.test&pbk=ab%2B%2F%3D&sid=aa&flow=xtls-rprx-vision&x=a+b/c=d#Test%20node'
-run 1 0 101 2 'trojan://user@example.test:99999' "$original" 4 0 > /run/first 2>&1
+run 1 0 101 2 'trojan://user@example.test:99999' "$original-v6" 4 0 > /run/first 2>&1
 [[ $(wc -l < "$state/ips.list") -eq 2 && $(wc -l < "$state/nodes.txt") -eq 2 ]]
 [[ $(stat -c '%a' "$state/nodes.txt") == 600 ]]
 [[ $(grep -c 'vless://' /run/first) -eq 2 ]]
@@ -124,13 +124,13 @@ test_ip "${old[1]}" 128
 
 run 2 'ss://YWVzLTEyOC1nY206dGVzdA@203.0.113.1:8388/?plugin=v2ray-plugin%3Bserver%3Dyes' 0 > /run/reused
 grep -Fxq "ss://YWVzLTEyOC1nY206dGVzdA@[${old[0]}]:8388/?plugin=v2ray-plugin%3Bserver%3Dyes#v6-01" "$state/nodes.txt"
-run 2 'trojan://secret%40test@example.test:0443?x=a/b+c%26#already' 0 > /run/reused
+run 2 'trojan://secret%40test@example.test:0443?x=a/b+c%26#already-v6-v6-02' 0 > /run/reused
 grep -Fxq "trojan://secret%40test@[${old[0]}]:0443?x=a/b+c%26#already-v6-01" "$state/nodes.txt"
-run 2 'hy2://secret@[::ffff:192.0.2.1]:8443?sni=example.test&obfs-password=A%2BB#' 0 > /run/reused
+run 2 'hy2://secret@[::ffff:192.0.2.1]:8443?sni=example.test&obfs-password=A%2BB#v6-01' 0 > /run/reused
 grep -Fxq "hy2://secret@[${old[0]}]:8443?sni=example.test&obfs-password=A%2BB#v6-01" "$state/nodes.txt"
 
 if command -v python3 >/dev/null; then
-    vmess='{"v":"2","add":"example.test","port":"443","id":"test","ps":"a/b+c","sni":"example.test","extra":{"nested":true}}'
+    vmess='{"v":"2","add":"example.test","port":"443","id":"test","ps":"a/b+c-v6-prod-v6-100","sni":"example.test","extra":{"nested":true}}'
     encoded=$(printf '%s' "$vmess" | base64 | tr -d '\n=' | tr '+/' '-_')
     run 2 "vmess://$encoded" 0 > /run/reused
     python3 - "$state/nodes.txt" "${old[0]}" "$vmess" <<'PY'
@@ -138,7 +138,7 @@ import base64, json, sys
 with open(sys.argv[1], encoding="ascii") as nodes:
     actual = json.loads(base64.b64decode(nodes.readline().strip().removeprefix("vmess://")))
 expected = json.loads(sys.argv[3])
-expected.update(add=sys.argv[2], ps="a/b+c-v6-01")
+expected.update(add=sys.argv[2], ps="a/b+c-v6-prod-v6-01")
 assert actual == expected
 PY
 fi

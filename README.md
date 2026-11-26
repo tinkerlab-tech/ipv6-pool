@@ -20,6 +20,8 @@ wget -O /root/ipv6-pool.sh https://raw.githubusercontent.com/tinkerlab-tech/ipv6
 
 之后运行 `bash /root/ipv6-pool.sh` 可重新打开菜单。已有节点可以选 **4** 重新显示单行导入串。
 
+生成节点时，备注末尾已有的 `-v6` 或 `-v6-序号` 会替换成新序号。
+
 ## 使用条件
 
 - VPS 的 IPv6 默认出口网卡需要有可用的全局单播 IPv6，地址掩码为 `/64` 或 `/48`。使用 `/48` 时，生成地址位于原生地址所在的 `/64` 子网内，绑定沿用 `/48`。

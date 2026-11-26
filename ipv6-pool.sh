@@ -23,6 +23,8 @@ IPS=$STATE/ips.list
 OWNED=$STATE/owned.list
 PENDING=$STATE/pending.ip
 NODES=$STATE/nodes.txt
+# 匹配备注末尾的旧池标记，也能清理过去重复追加的标记。
+V6_NAME_SUFFIX='(^|-)v6(-([0-9]{2}|100))?(-v6(-([0-9]{2}|100))?)*'
 
 declare -a pool=()
 declare -A protected=() owned=() wanted=() present=() live=() route_sources=()
@@ -463,30 +465,31 @@ vmess_links() {
     local address addresses=''
     if has python3; then
         decode_base64 "$vmess_payload" | python3 -c '
-import base64, json, sys
+import base64, json, re, sys
 profile = json.loads(sys.stdin.buffer.read().decode("utf-8"))
 if (not isinstance(profile, dict) or not isinstance(profile.get("add"), str)
         or not profile["add"] or not isinstance(profile.get("ps"), (str, type(None)))):
     sys.exit(1)
-name = profile.get("ps") or ""
-for index, address in enumerate(sys.argv[1:], 1):
+name = re.sub(sys.argv[1] + r"\Z", "", profile.get("ps") or "")
+for index, address in enumerate(sys.argv[2:], 1):
     profile["add"] = address
     profile["ps"] = (name + "-" if name else "") + "v6-{:02d}".format(index)
     data = json.dumps(profile, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     print("vmess://" + base64.b64encode(data.encode("utf-8")).decode("ascii"))
-' "$@"
+' "$V6_NAME_SUFFIX" "$@"
     else
         for address in "$@"; do addresses+="$address"$'\n'; done
-        decode_base64 "$vmess_payload" | jq -scr --arg addresses "$addresses" '
+        decode_base64 "$vmess_payload" | jq -scr --arg addresses "$addresses" --arg suffix "$V6_NAME_SUFFIX" '
             if length != 1 then error("expected one object") else .[0] end |
             if type != "object" or (.add | type != "string" or length == 0)
                or ((.ps // "") | type != "string") or .ps == false
             then error("invalid profile") else . end |
-            . as $profile | ($addresses | split("\n") | map(select(length > 0)) | to_entries[]) as $entry |
+            . as $profile |
+            ((.ps // "") | sub($suffix + "\\z"; "") | if length == 0 then "" else . + "-" end) as $name |
+            ($addresses | split("\n") | map(select(length > 0)) | to_entries[]) as $entry |
             ($entry.value) as $address |
             (($entry.key + 1) | tostring | if length < 2 then "0" + . else . end) as $number |
-            ($profile | .add = $address | .ps = ((.ps // "") | if length == 0 then "" else . + "-" end)
-                + "v6-" + $number) |
+            ($profile | .add = $address | .ps = ($name + "v6-" + $number)) |
             "vmess://" + (tojson | @base64)
         '
     fi
@@ -534,6 +537,7 @@ parse_link() {
     link_tail=${after%%#*}
     link_name=''
     if [[ $after == *'#'* ]]; then link_name=${after#*#}; fi
+    if [[ $link_name =~ ${V6_NAME_SUFFIX}$ ]]; then link_name=${link_name%"${BASH_REMATCH[0]}"}; fi
 }
 
 ask_count() {
