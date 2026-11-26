@@ -7,13 +7,15 @@
 登录 VPS 的 root 终端，复制并运行下面的命令。仓库公开，下载无需登录 GitHub。
 
 ```bash
-curl -fL https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh -o /root/ipv6-pool.sh && bash /root/ipv6-pool.sh
+curl -fL "https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh?v=$(date +%s)" -o /root/ipv6-pool.sh && bash /root/ipv6-pool.sh
 ```
+
+下载地址带上当前时间，避免更新时拿到缓存的旧版本。
 
 有 `wget` 的系统也可使用以下命令。
 
 ```bash
-wget -O /root/ipv6-pool.sh https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh && bash /root/ipv6-pool.sh
+wget -O /root/ipv6-pool.sh "https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh?v=$(date +%s)" && bash /root/ipv6-pool.sh
 ```
 
 选 **1**，输入数量或回车使用默认的 **10**，再粘贴现有节点链接。脚本收到有效链接后绑定地址。复制分割线之间的 Base64 单行导入串，在 v2rayN 主界面按一次 `Ctrl + V`，即可批量导入整组节点。终端可能自动折行，复制时请完整选中分割线之间的内容。[v2rayN 剪贴板导入说明](https://github.com/2dust/v2rayN/wiki/Description-of-some-ui)
