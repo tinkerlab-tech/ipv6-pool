@@ -7,20 +7,18 @@
 登录 VPS 的 root 终端，复制并运行下面的命令。仓库公开，下载无需登录 GitHub。
 
 ```bash
-curl -fL "https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh?v=$(date +%s)" -o /root/ipv6-pool.sh && bash /root/ipv6-pool.sh
+curl -fL https://github.com/tinkerlab-tech/ipv6-pool/raw/main/ipv6-pool.sh -o v6.sh && bash v6.sh
 ```
-
-下载地址带上当前时间，避免更新时拿到缓存的旧版本。
 
 有 `wget` 的系统也可使用以下命令。
 
 ```bash
-wget -O /root/ipv6-pool.sh "https://raw.githubusercontent.com/tinkerlab-tech/ipv6-pool/main/ipv6-pool.sh?v=$(date +%s)" && bash /root/ipv6-pool.sh
+wget -O v6.sh https://github.com/tinkerlab-tech/ipv6-pool/raw/main/ipv6-pool.sh && bash v6.sh
 ```
 
 选 **1**，输入数量或回车使用默认的 **10**，再粘贴现有节点链接。脚本收到有效链接后绑定地址。复制分割线之间的 Base64 单行导入串，在 v2rayN 主界面按一次 `Ctrl + V`，即可批量导入整组节点。终端可能自动折行，复制时请完整选中分割线之间的内容。[v2rayN 剪贴板导入说明](https://github.com/2dust/v2rayN/wiki/Description-of-some-ui)
 
-之后运行 `bash /root/ipv6-pool.sh` 可重新打开菜单。已有节点可以选 **4** 重新显示单行导入串。
+之后运行 `bash v6.sh` 可重新打开菜单。已有节点可以选 **4** 重新显示单行导入串。
 
 生成节点时，备注末尾已有的 `-v6` 或 `-v6-序号` 会替换成新序号。
 
@@ -44,7 +42,7 @@ wget -O /root/ipv6-pool.sh "https://raw.githubusercontent.com/tinkerlab-tech/ipv
 
 状态目录为 `/var/lib/ipv6-pool/`，地址存于 `ips.list`，含节点凭据的逐条链接存于仅 root 可读写的 `nodes.txt`。单行导入串也包含这些凭据。开机恢复依次适配 systemd、OpenRC 和 `/etc/rc.local`。使用 `rc.local` 的系统需在启动时执行该文件。
 
-需要立即恢复已有地址时，运行 `bash /root/ipv6-pool.sh --restore`。新池遇到 IPv6 重复地址冲突时会补抽。已发布的地址在冲突排除后会按原地址恢复，已经导入的节点可以继续使用。
+需要立即恢复已有地址时，运行 `bash v6.sh --restore`。新池遇到 IPv6 重复地址冲突时会补抽。已发布的地址在冲突排除后会按原地址恢复，已经导入的节点可以继续使用。
 
 洗牌和卸载会核对启动 ID、内核绑定创建时间、原生地址快照和默认路由源地址。来源无法确认的地址会保留，包括旧版已绑定而新版还没有记录归属的地址。升级后可用选项 **2** 更新开机恢复副本，下一次启动由新版重新绑定的地址会自动建立归属记录。
 
