@@ -13,6 +13,11 @@ set -o pipefail
 export LC_ALL=C
 umask 077
 
+if ! (( BASH_VERSINFO[0] > 4 || BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2 )); then
+    printf 'IPv6 节点池：%s\n' '需要 Bash 4.2 或更新版本。Alpine 可运行 apk add bash iproute2。' >&2
+    exit 1
+fi
+
 STATE=/var/lib/ipv6-pool
 RUNNER=$STATE/ipv6-pool.sh
 UNIT=/etc/systemd/system/ipv6-pool-restore.service
@@ -33,7 +38,7 @@ V6_NAME_SUFFIX='(^|-)v6(-([0-9]{2}|100))?(-v6(-([0-9]{2}|100))?)*'
 declare -a pool=() next_pool=() dad_failed=()
 declare -A protected=() owned=() proofs=() wanted=() present=() live=() route_sources=()
 device='' prefix='' mask=''
-detected_dev='' detected_prefix='' detected_mask='' detection_error=''
+detected_dev='' detected_prefix='' detected_mask='' detection_error='' link_error=''
 address_snapshot='' routes='' boot_id=''
 binding_details='' binding_index='' binding_removed=0
 
@@ -173,7 +178,7 @@ scan_addresses() {
     address_snapshot=$(ip -o -6 addr show) || return 1
     present=() live=()
     while read -r _number dev family cidr details; do
-        [[ $family == inet6 ]] || continue
+        [[ $family == inet6 && $cidr == */* ]] || continue
         expand_ipv6 "${cidr%/*}" || continue
         present[$expanded]=1
         live["${dev%%@*}/$expanded/${cidr##*/}"]=" $details "
@@ -223,7 +228,7 @@ detect_network() {
     detected_dev=$route_dev
     if [[ -n $route_src ]] && expand_ipv6 "$route_src"; then source=$expanded; fi
     while read -r _number dev family cidr details; do
-        [[ ${dev%%@*} == "$route_dev" && $family == inet6 && " $details " == *' scope global '* ]] || continue
+        [[ ${dev%%@*} == "$route_dev" && $family == inet6 && $cidr == */* && " $details " == *' scope global '* ]] || continue
         expand_ipv6 "${cidr%/*}" || continue
         [[ $expanded == [23]* && ! ${owned[$expanded]+yes} && ! ${wanted[$expanded]+yes} ]] || continue
         [[ " $details " != *' tentative '* && " $details " != *' dadfailed '* ]] || continue
@@ -233,6 +238,7 @@ detect_network() {
         if valid_mask "${cidr##*/}"; then
             detected_prefix=${expanded%:*:*:*:*}
             detected_mask=${cidr##*/}
+            detection_error=''
             return 0
         fi
     done <<< "$address_snapshot"
@@ -278,7 +284,7 @@ lookup_binding() {
     binding_details='' binding_index=''
     snapshot=$(ip -o -6 addr show to "$address/128") || return 1
     while read -r index dev family cidr details; do
-        [[ ${dev%%@*} == "$device" && $family == inet6 && ${cidr##*/} == "$mask" ]] || continue
+        [[ ${dev%%@*} == "$device" && $family == inet6 && $cidr == */* && ${cidr##*/} == "$mask" ]] || continue
         if ! expand_ipv6 "${cidr%/*}" || [[ $expanded != "$address" ]]; then continue; fi
         binding_index=${index%:}
         binding_details=" $details "
@@ -574,10 +580,16 @@ remove_systemd() {
 }
 
 install_boot() {
-    [[ -f ${BASH_SOURCE[0]} ]] || return 1
+    if [[ ! -f ${BASH_SOURCE[0]} ]]; then
+        error '请先将脚本保存到本地文件再运行，不支持通过管道直接执行。'
+        return 1
+    fi
     if [[ ! ${BASH_SOURCE[0]} -ef $RUNNER ]]; then
-        cp "${BASH_SOURCE[0]}" "$RUNNER.new" && chmod 700 "$RUNNER.new" &&
-            mv -f "$RUNNER.new" "$RUNNER" || return 1
+        if ! cp "${BASH_SOURCE[0]}" "$RUNNER.new" || ! chmod 700 "$RUNNER.new" ||
+            ! mv -f "$RUNNER.new" "$RUNNER"; then
+            error "无法复制开机恢复脚本到 $RUNNER。"
+            return 1
+        fi
     fi
     if is_systemd; then
         if install_systemd; then info '开机恢复已启用（systemd）。'; return 0; fi
@@ -587,7 +599,12 @@ install_boot() {
         if install_openrc; then info '开机恢复已启用（OpenRC）。'; return 0; fi
         if has_hook "$OPENRC"; then rm -f "$OPENRC" || return 1; fi
     fi
-    edit_rc_local add && info '开机恢复命令已写入 /etc/rc.local。'
+    if edit_rc_local add; then
+        info '开机恢复命令已写入 /etc/rc.local。'
+        return 0
+    fi
+    error '无法写入开机恢复配置（/etc/rc.local）。'
+    return 1
 }
 
 remove_boot() {
@@ -616,8 +633,15 @@ vmess_links() {
         decode_base64 "$vmess_payload" | python3 -c '
 import base64, json, re, sys
 profile = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+port = profile.get("port") if isinstance(profile, dict) else None
+port_ok = (
+    (isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535)
+    or (isinstance(port, str) and re.fullmatch(r"[0-9]{1,5}", port) is not None and 1 <= int(port) <= 65535)
+)
 if (not isinstance(profile, dict) or not isinstance(profile.get("add"), str)
-        or not profile["add"] or not isinstance(profile.get("ps"), (str, type(None)))):
+        or not profile["add"] or not isinstance(profile.get("id"), str)
+        or not profile["id"] or not port_ok
+        or not isinstance(profile.get("ps"), (str, type(None)))):
     sys.exit(1)
 name = re.sub(sys.argv[1] + r"\Z", "", profile.get("ps") or "")
 if (profile.get("tls") in ("tls", "reality") and not profile.get("sni")
@@ -634,6 +658,12 @@ for index, address in enumerate(sys.argv[2:], 1):
         decode_base64 "$vmess_payload" | jq -scr --arg addresses "$address_lines" --arg suffix "$V6_NAME_SUFFIX" '
             if length != 1 then error("expected one object") else .[0] end |
             if type != "object" or (.add | type != "string" or length == 0)
+               or (.id | type != "string" or length == 0)
+               or (
+                   ((.port | type == "number" and . == floor and . >= 1 and . <= 65535)
+                    or (.port | type == "string" and test("^[0-9]{1,5}$") and (sub("^0+(?=[0-9])"; "") | tonumber | . >= 1 and . <= 65535)))
+                   | not
+               )
                or ((.ps // "") | type != "string") or .ps == false
             then error("invalid profile") else . end |
             if (.tls == "tls" or .tls == "reality") and ((.sni // "") == "") and ((.host // "") == "")
@@ -686,50 +716,122 @@ preserve_tls_name() {
 
 parse_link() {
     local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter
+    link_error=''
     link_scheme=${link%%://*}
     body=${link#*://}
-    [[ $link != "$body" && -n $body && ! $link =~ [[:space:][:cntrl:]] ]] || return 1
+    if [[ -z $link_scheme || $link == "$body" ]]; then
+        link_error='未识别到节点链接（缺少「协议://」前缀），请粘贴单条节点链接。'
+        return 1
+    fi
+    if [[ -z $body ]]; then
+        link_error='节点链接不完整，协议前缀后缺少内容。'
+        return 1
+    fi
+    if [[ $link =~ [[:space:][:cntrl:]] ]]; then
+        link_error='链接包含空格或控制字符。如果备注里有空格，请删除或替换为 %20 后重新粘贴。'
+        return 1
+    fi
+    link_scheme=${link_scheme,,}
     case $link_scheme in
         vmess)
             if ! has python3 && ! has jq; then
-                error 'VMess 需要 python3 或 jq。你也可以粘贴其他受支持的协议链接。'
-                return 2
+                link_error='VMess 需要 python3 或 jq。你也可以粘贴其他受支持的协议链接。'
+                return 1
             fi
             vmess_payload=$body
-            vmess_links >/dev/null 2>&1
-            return
+            if ! vmess_links >/dev/null 2>&1; then
+                if [[ $body == *@* ]]; then
+                    link_error='VMess 仅支持标准 Base64 JSON 格式（vmess://base64...）。'
+                else
+                    link_error='VMess 链接无效，Base64 解码失败或缺少有效的地址、端口或凭据配置。'
+                fi
+                return 1
+            fi
+            return 0
             ;;
         vless|trojan|hysteria2|hy2|ss|anytls|tuic) ;;
-        *) return 1 ;;
+        hysteria)
+            link_error='不支持 Hysteria v1（hysteria://），请使用 Hysteria 2（hysteria2:// 或 hy2://）。'
+            return 1
+            ;;
+        *)
+            link_error="不支持的协议「${link_scheme}://」。支持：vless、vmess、trojan、hysteria2/hy2、ss（SIP002）、anytls、tuic。"
+            return 1
+            ;;
     esac
     authority=${body%%[/?#]*}
     link_auth=${authority%@*}
     endpoint=${authority##*@}
-    [[ -n $link_auth && $authority == *@* && $link_auth != *@* ]] || return 1
+    if [[ $authority != *@* ]]; then
+        if [[ $link_scheme == ss ]]; then
+            link_error='暂不支持不含 @ 的旧版 Base64 Shadowsocks 链接，请使用 SIP002 格式（ss://凭据@地址:端口）。'
+        else
+            link_error='链接缺少凭据或 @ 分隔符（格式应为 协议://凭据@地址:端口）。'
+        fi
+        return 1
+    fi
+    if [[ -z $link_auth ]]; then
+        link_error='链接缺少凭据部分（@ 前不能为空）。'
+        return 1
+    fi
+    if [[ $link_auth == *@* ]]; then
+        link_error='凭据部分包含未转义的 @，请先将密码中的 @ 编码为 %40 后重新粘贴。'
+        return 1
+    fi
     if [[ $link_scheme == tuic ]]; then
-        [[ $link_auth == *:* && -n ${link_auth%%:*} && -n ${link_auth#*:} ]] || return 1
+        if [[ $link_auth != *:* || -z ${link_auth%%:*} || -z ${link_auth#*:} ]]; then
+            link_error='TUIC v5 链接凭据格式无效，应为 uuid:password@地址:端口。'
+            return 1
+        fi
     fi
     if [[ $endpoint == \[* ]]; then
-        [[ $endpoint =~ ^\[([^]]+)\](:([^:]+))?$ ]] || return 1
+        if [[ ! $endpoint =~ ^\[([^]]+)\](:([^:]+))?$ ]]; then
+            link_error='节点 IPv6 地址格式无效，请检查方括号和端口写法（如 [2001:db8::1]:443）。'
+            return 1
+        fi
         host=${BASH_REMATCH[1]}
         link_port=${BASH_REMATCH[3]}
         if [[ $host == *%25* ]]; then
-            [[ ${host#*%25} =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+            if [[ ! ${host#*%25} =~ ^[A-Za-z0-9_.-]+$ ]]; then
+                link_error='节点 IPv6 地址的区域标识（%25 后）无效。'
+                return 1
+            fi
             host=${host%%\%25*}
         fi
-        expand_ipv6 "$host" || return 1
+        if ! expand_ipv6 "$host"; then
+            link_error='节点 IPv6 地址无效，请检查方括号内的 IPv6 写法。'
+            return 1
+        fi
     else
-        [[ $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*)(:([^:]+))?$ ]] || return 1
+        if [[ ! $endpoint =~ ^([A-Za-z0-9_][A-Za-z0-9_.-]*)(:([^:]+))?$ ]]; then
+            link_error='节点地址格式无效，请检查域名、IPv4 或带方括号的 IPv6 地址。'
+            return 1
+        fi
         host=${BASH_REMATCH[1]}
         link_port=${BASH_REMATCH[3]}
-        if [[ $host =~ ^[0-9.]+$ && $host == *.* ]]; then ipv4_valid "$host" || return 1; fi
+        if [[ $host =~ ^[0-9.]+$ && $host == *.* ]] && ! ipv4_valid "$host"; then
+            link_error='节点 IPv4 地址无效，请检查地址后重新粘贴。'
+            return 1
+        fi
     fi
     case $link_scheme in
-        hysteria2|hy2) link_port=${link_port:-443}; valid_hysteria_ports "$link_port" || return 1 ;;
+        hysteria2|hy2)
+            link_port=${link_port:-443}
+            if ! valid_hysteria_ports "$link_port"; then
+                link_error='Hysteria 2 端口无效，仅支持 1–65535 的单端口或有效跳跃范围（如 443、5000-6000）。'
+                return 1
+            fi
+            ;;
         *)
             if [[ $link_scheme == anytls ]]; then link_port=${link_port:-443}; fi
-            [[ $link_port =~ ^[0-9]{1,5}$ ]] &&
-                (( 10#$link_port >= 1 && 10#$link_port <= 65535 )) || return 1
+            if [[ -z $link_port ]]; then
+                link_error="协议 ${link_scheme}:// 缺少端口号（需为 1–65535 的整数）。"
+                return 1
+            fi
+            if [[ ! $link_port =~ ^[0-9]{1,5}$ ]] || ! (( 10#$link_port >= 1 && 10#$link_port <= 65535 )); then
+                link_error='节点端口无效，需为 1–65535 之间的整数。'
+                return 1
+            fi
             ;;
     esac
     after=${body#"$authority"}
@@ -791,14 +893,14 @@ print_import_line() {
 }
 
 read_node_link() {
-    local link result
+    local link
     while read -r -p '粘贴一条原节点链接（回车取消）：' link; do
         link=${link%$'\r'}
+        link=${link#"${link%%[![:space:]]*}"}
+        link=${link%"${link##*[![:space:]]}"}
         [[ -n $link ]] || return 1
-        parse_link "$link"
-        result=$?
-        if (( result == 0 )); then return 0; fi
-        if (( result != 2 )); then error '链接无效，请检查协议、凭据、地址和端口后重新粘贴。'; fi
+        if parse_link "$link"; then return 0; fi
+        error "${link_error:-链接无效，请检查后重新粘贴。}"
     done
     return 1
 }
@@ -835,13 +937,19 @@ prepare_pool_commit() {
 }
 
 generate() {
-    local count
+    local count fresh_init=0 initial_protected=0
     check_network || return 1
     if ! ask_count || ! read_node_link; then return 0; fi
+    if [[ -z $device ]]; then fresh_init=1; fi
     init_pool && recover_pending && prune_owned || return 1
+    initial_protected=${#protected[@]}
     if ! prepare_pool_commit "$count"; then
         if ! read_state || ! recover_pending || ! prune_owned; then
             error '候选地址未能完全清理，重新运行后可继续清理。'
+        elif (( fresh_init && ! ${#pool[@]} && ! ${#owned[@]} && ${#protected[@]} == initial_protected )) &&
+            [[ ! -e $PENDING && ! -e $TRANSITION ]]; then
+            rm -f "$CONFIG" "$PROTECTED"
+            device='' prefix='' mask='' protected=()
         fi
         return 1
     fi
@@ -882,7 +990,12 @@ menu() {
         detect_network || :
         shown_prefix=${prefix:-$detected_prefix}
         shown_mask=${mask:-$detected_mask}
-        if [[ -n $shown_prefix ]]; then shown_prefix+="::/$shown_mask"; else shown_prefix=未检测到; fi
+        if [[ -n $shown_prefix ]]; then
+            if [[ $shown_mask == 48 ]]; then shown_prefix+='::/64（掩码 /48）'
+            else shown_prefix+="::/$shown_mask"; fi
+        else
+            shown_prefix=未检测到
+        fi
         printf '\n网卡 %s | IPv6 网段 %s | 已管理 %d 个地址\n' "${device:-${detected_dev:-未检测到}}" \
             "$shown_prefix" "${#owned[@]}"
         if [[ -n $detection_error && -z $detected_prefix ]]; then
@@ -914,8 +1027,6 @@ main() {
         *) die '未知参数。请使用 --help。' ;;
     esac
     (( EUID == 0 )) || die '请使用 root 权限运行。'
-    (( BASH_VERSINFO[0] > 4 || BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 2 )) ||
-        die '需要 Bash 4.2 或更新版本。Alpine 可运行 apk add bash iproute2。'
     local version
     version=$(ip -V 2>&1) || version=''
     [[ $version == *iproute2* ]] ||

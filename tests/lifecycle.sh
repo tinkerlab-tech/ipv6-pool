@@ -141,9 +141,21 @@ run 2 'hy2://secret@[::ffff:192.0.2.1]:8443?sni=example.test&obfs-password=A%2BB
 grep -Fxq "hy2://secret@[${old[0]}]:8443?sni=example.test&obfs-password=A%2BB#v6-01" "$state/nodes.txt"
 run 2 'hysteria2://secret@example.test/?insecure=0#Default' 0 > /run/reused
 grep -Fxq "hysteria2://secret@[${old[0]}]:443/?insecure=0&sni=example.test#Default-v6-01" "$state/nodes.txt"
-run 2 'hy2://secret@example.test:6000-5000/#Invalid' \
-    'hy2://secret@[2001:db8::2]:443,5000-6000/?sni=example.test#Hop' 0 > /run/reused 2>&1
-grep -Fq '链接无效' /run/reused
+run 2 'not-a-link' \
+    'ssr://example.test:443' \
+    'hysteria://example.test:443' \
+    'ss://YWVzLTEyOC1nY206dGVzdEAxLjIuMy40OjgzODg=#Legacy' \
+    'tuic://onlyuuid@example.test:443#NoPass' \
+    'vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@example.test:443#Has Space' \
+    'hy2://secret@example.test:6000-5000/#Invalid' \
+    $'  HY2://secret@[2001:db8::2]:443,5000-6000/?sni=example.test#Hop \r' 0 > /run/reused 2>&1
+grep -Fq '未识别到节点链接' /run/reused
+grep -Fq '不支持的协议「ssr://」' /run/reused
+grep -Fq '不支持 Hysteria v1' /run/reused
+grep -Fq 'SIP002' /run/reused
+grep -Fq 'TUIC v5 链接凭据格式无效' /run/reused
+grep -Fq '链接包含空格或控制字符' /run/reused
+grep -Fq 'Hysteria 2 端口无效' /run/reused
 grep -Fxq "hy2://secret@[${old[0]}]:443/?sni=example.test&mport=443%2C5000-6000#Hop-v6-01" "$state/nodes.txt"
 run 2 'vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@example.test:443?security=tls#TLS' 0 > /run/reused
 grep -Fxq "vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@[${old[0]}]:443?security=tls&sni=example.test#TLS-v6-01" "$state/nodes.txt"
