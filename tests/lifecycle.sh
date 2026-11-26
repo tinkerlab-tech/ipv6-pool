@@ -232,7 +232,7 @@ exec "$IPV6_POOL_TEST_IP" "$@"
 IP
     chmod +x /run/bin/ip
     run 3 2 "$original" 0 > /run/shuffle 2>&1
-    grep -Fq '洗牌未完成' /run/shuffle
+    grep -Fq '更换地址未完成' /run/shuffle
     cmp "$state/ips.list" /run/ips.before
     cmp "$state/nodes.txt" /run/nodes.before
     ip -o -6 addr show dev "$dev" | awk '{print $4}' | sort | cmp - /run/network.before

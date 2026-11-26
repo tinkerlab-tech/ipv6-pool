@@ -853,7 +853,7 @@ generate() {
 reuse_pool() {
     local result
     local -a links=()
-    if (( ! ${#pool[@]} )); then error '还没有可复用的 IPv6 地址池。'; return 1; fi
+    if (( ! ${#pool[@]} )); then error '还没有已生成的 IPv6 地址，请先选 1。'; return 1; fi
     check_network || return 1
     read_node_link || return 0
     result=$(build_links "${pool[@]}") || return 1
@@ -883,22 +883,23 @@ menu() {
         shown_prefix=${prefix:-$detected_prefix}
         shown_mask=${mask:-$detected_mask}
         if [[ -n $shown_prefix ]]; then shown_prefix+="::/$shown_mask"; else shown_prefix=未检测到; fi
-        printf '\n网卡 %s | 前缀 %s | 已托管 %d\n' "${device:-${detected_dev:-未检测到}}" \
+        printf '\n网卡 %s | IPv6 网段 %s | 已管理 %d 个地址\n' "${device:-${detected_dev:-未检测到}}" \
             "$shown_prefix" "${#owned[@]}"
         if [[ -n $detection_error && -z $detected_prefix ]]; then
             error "$detection_error"
         fi
-        info '1. 一键生成 IPv6 池并裂变节点' '2. 复用现有 IPv6 池重新裂变' \
-            '3. 一键洗牌换血' '4. 查看历史链接与单行导入串' '5. 一键清理并彻底卸载' '0. 退出'
-        read -r -p '选择操作：' choice || return 0
+        info '1. 新建 IPv6 地址池并生成节点链接' '2. 用现有地址重新生成节点链接' \
+            '3. 换一批地址并生成新节点链接' '4. 查看上次生成的节点链接' \
+            '5. 删除脚本管理的地址并卸载' '0. 退出'
+        read -r -p '请输入选项数字（0-5）：' choice || return 0
         case $choice in
-            1) if (( ${#pool[@]} )); then error '现有地址池可通过选项 2 复用，或通过选项 3 更换。'
+            1) if (( ${#pool[@]} )); then error '已经有地址池。选 2 使用现有地址，选 3 更换地址。'
                else generate || error '生成未完成，可在菜单中继续操作。'; fi ;;
-            2) reuse_pool || error '复用未完成。' ;;
-            3) generate || error '洗牌未完成，可在菜单中继续操作。' ;;
-            4) if [[ ! -s $NODES ]]; then info '暂无历史节点链接。'
-               elif ! print_nodes || ! print_import_line; then error '读取历史节点链接失败。'; fi ;;
-            5) if cleanup; then return 0; else error '清理未完成，可以重试。'; fi ;;
+            2) reuse_pool || error '未能重新生成节点链接。' ;;
+            3) generate || error '更换地址未完成，可在菜单中继续操作。' ;;
+            4) if [[ ! -s $NODES ]]; then info '还没有生成过节点链接。'
+               elif ! print_nodes || ! print_import_line; then error '未能读取上次生成的节点链接。'; fi ;;
+            5) if cleanup; then return 0; else error '卸载未完成，可以重试。'; fi ;;
             0) return 0 ;;
             *) error '请选择 0 到 5。' ;;
         esac
