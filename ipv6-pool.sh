@@ -1022,7 +1022,7 @@ generate() {
             error '候选地址未能完全清理，重新运行后可继续清理。'
         elif (( fresh_init && ! ${#pool[@]} && ! ${#owned[@]} && ${#protected[@]} == initial_protected )) &&
             [[ ! -e $PENDING && ! -e $TRANSITION ]]; then
-            rm -f "$CONFIG" "$PROTECTED"
+            rm -f "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS"
             device='' prefix='' mask='' protected=()
         fi
         return 1
