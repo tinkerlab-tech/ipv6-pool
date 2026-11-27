@@ -66,6 +66,19 @@ ipv4_valid() {
     done
 }
 
+ipv4_public() {
+    local -a octets
+    ipv4_valid "$1" || return 1
+    IFS=. read -r -a octets <<< "$1"
+    local a=$((10#${octets[0]})) b=$((10#${octets[1]}))
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    return 0
+}
+
 # 规范化为小写八组，包括双冒号和 IPv4 嵌入式写法。
 expand_ipv6() {
     local addr=$1 left right tail hex part missing=0 index=0
@@ -720,7 +733,7 @@ preserve_tls_name() {
 
 parse_link() {
     local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter
-    link_error=''
+    link_error='' link_host=''
     link_scheme=${link%%://*}
     body=${link#*://}
     if [[ -z $link_scheme || $link == "$body" ]]; then
@@ -839,6 +852,7 @@ parse_link() {
             ;;
     esac
     after=${body#"$authority"}
+    link_host=$host
     link_tail=${after%%#*}
     if [[ $link_tail == *\?* ]]; then query=${link_tail#*\?}; fi
     case $link_scheme in
@@ -896,6 +910,27 @@ print_import_line() {
         '--------------------' "$encoded" '--------------------'
 }
 
+warn_foreign_host() {
+    local expanded _num _dev family cidr addr has_public_v4=0 matched_v4=0 v4_snapshot
+    [[ -n ${link_host:-} ]] || return 0
+    if [[ $link_host == *:* ]] && expand_ipv6 "$link_host"; then
+        if [[ ! ${present[$expanded]+yes} ]]; then
+            info "提示：原链接中的 IPv6（$link_host）不在本机网卡上，请确认没有贴错其他 VPS 的节点（贴错可选 2 重贴）。"
+        fi
+    elif ipv4_valid "$link_host"; then
+        v4_snapshot=$(ip -o -4 addr show scope global 2>/dev/null) || return 0
+        while read -r _num _dev family cidr _; do
+            [[ $family == inet && $cidr == */* ]] || continue
+            addr=${cidr%/*}
+            if [[ $addr == "$link_host" ]]; then matched_v4=1; break; fi
+            if ipv4_public "$addr"; then has_public_v4=1; fi
+        done <<< "$v4_snapshot"
+        if (( ! matched_v4 && has_public_v4 )); then
+            info "提示：原链接中的 IPv4（$link_host）与本机公网 IPv4 不一致，若非中转/NAT 机器，请确认没有贴错节点（贴错可选 2 重贴）。"
+        fi
+    fi
+}
+
 read_node_link() {
     local link
     while read -r -p '粘贴一条原节点链接（回车取消）：' link; do
@@ -903,7 +938,10 @@ read_node_link() {
         link=${link#"${link%%[![:space:]]*}"}
         link=${link%"${link##*[![:space:]]}"}
         [[ -n $link ]] || return 1
-        if parse_link "$link"; then return 0; fi
+        if parse_link "$link"; then
+            warn_foreign_host
+            return 0
+        fi
         error "${link_error:-链接无效，请检查后重新粘贴。}"
     done
     return 1

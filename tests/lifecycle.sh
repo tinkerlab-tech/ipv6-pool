@@ -93,6 +93,7 @@ run 1 0 101 2 'trojan://user@example.test:99999' "$original-v6" 4 0 > /run/first
 [[ $(wc -l < "$state/ips.list") -eq 2 && $(wc -l < "$state/nodes.txt") -eq 2 ]]
 [[ $(stat -c '%a' "$state/nodes.txt") == 600 ]]
 [[ $(grep -c 'vless://' /run/first) -eq 2 ]]
+grep -Fq '不在本机网卡上' /run/first
 mapfile -t imports < <(grep -E '^[A-Za-z0-9+/]+={0,2}$' /run/first)
 [[ ${#imports[@]} -eq 2 && ${imports[0]} == "${imports[1]}" ]]
 printf '%s' "${imports[0]}" | base64 -d | cmp - "$state/nodes.txt"
