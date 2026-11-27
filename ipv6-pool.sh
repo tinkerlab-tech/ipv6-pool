@@ -38,7 +38,7 @@ V6_NAME_SUFFIX='(^|-)v6(-([0-9]{2}|100))?(-v6(-([0-9]{2}|100))?)*'
 declare -a pool=() next_pool=() dad_failed=()
 declare -A protected=() owned=() proofs=() wanted=() present=() live=() route_sources=()
 device='' prefix='' mask=''
-detected_dev='' detected_prefix='' detected_mask='' detection_error='' link_error=''
+detected_dev='' detected_prefix='' detected_mask='' detected_ip='' detected_ip_raw='' detection_error='' link_error=''
 address_snapshot='' routes='' boot_id=''
 binding_details='' binding_index='' binding_removed=0
 
@@ -202,7 +202,7 @@ scan_routes() {
 
 detect_network() {
     local route_dev route_src _number dev family cidr details expanded source='' first_mask=''
-    detected_dev='' detected_prefix='' detected_mask=''
+    detected_dev='' detected_prefix='' detected_mask='' detected_ip='' detected_ip_raw=''
     detection_error='无法读取 IPv6 路由或地址。'
     scan_routes && scan_addresses || return 1
     # 按 dev、src 和 metric 取字段，兼容点对点路由与多路径的 nexthop 行。
@@ -238,6 +238,8 @@ detect_network() {
         if valid_mask "${cidr##*/}"; then
             detected_prefix=${expanded%:*:*:*:*}
             detected_mask=${cidr##*/}
+            detected_ip=$expanded
+            detected_ip_raw=${cidr%/*}
             detection_error=''
             return 0
         fi
@@ -263,6 +265,8 @@ check_network() {
                 if [[ $key == "$device/$prefix":*"/$mask" && ! ${wanted[$address]+yes} && ! ${owned[$address]+yes} &&
                     $details == *' scope global '* && $details != *' tentative '* &&
                     $details != *' dadfailed '* && $details != *' deprecated '* ]]; then
+                    detected_ip=$address
+                    detected_ip_raw=$address
                     return 0
                 fi
             done
@@ -923,10 +927,80 @@ show_result() {
     info "已保存到 $NODES。请确保防火墙已放行对应端口的 IPv6 流量。"
 }
 
+probe_ipv6_target() {
+    local src=$1 target=$2
+    if has curl; then
+        curl -6 --interface "$src" --connect-timeout 2 -m 3 -s -o /dev/null -k "https://[$target]/"
+    elif has ping; then
+        ping -6 -c 1 -W 2 -I "$src" "$target" >/dev/null 2>&1
+    elif has ping6; then
+        ping6 -c 1 -W 2 -I "$src" "$target" >/dev/null 2>&1
+    else
+        return 2
+    fi
+}
+
+# 用原生 IPv6 与新绑定地址做对比探测，识别“掩码为 /64 但宿主机仅放行单个 IPv6”或限额环境。
+verify_pool_reachability() {
+    local target address tested=0 failed_count=0 ok native_shown=${detected_ip_raw:-$detected_ip}
+    local -a targets=(2606:4700:4700::1111 2001:4860:4860::8888 2620:fe::fe)
+    local -a usable_targets=() samples=()
+    local count=${#next_pool[@]}
+    [[ -n $detected_ip && $count -gt 0 ]] || return 0
+    if ! has curl && ! has ping && ! has ping6; then return 0; fi
+
+    for target in "${targets[@]}"; do
+        if probe_ipv6_target "$detected_ip" "$target"; then
+            usable_targets+=("$target")
+            (( ${#usable_targets[@]} >= 2 )) && break
+        fi
+    done
+    # 原生 IPv6 自身无法连通任何探测目标（如无公网/离线测试/出站受限）时跳过，避免误杀。
+    (( ${#usable_targets[@]} )) || return 0
+
+    samples=("${next_pool[0]}")
+    if (( count == 2 )); then
+        samples+=("${next_pool[1]}")
+    elif (( count >= 3 )); then
+        samples+=("${next_pool[count / 2]}" "${next_pool[count - 1]}")
+    fi
+
+    info "正在验证新绑定的 IPv6 是否可连通外网（抽测 ${#samples[@]} 个地址）..."
+    for address in "${samples[@]}"; do
+        tested=$((tested + 1))
+        ok=0
+        for target in "${usable_targets[@]}"; do
+            if probe_ipv6_target "$address" "$target"; then
+                ok=1
+                break
+            fi
+        done
+        if (( ! ok )); then
+            failed_count=$((failed_count + 1))
+            # 连续 2 个不同新地址在多个公网目标上均超时，足以确认整段未放行，提前结束等待。
+            if (( failed_count >= 2 && failed_count == tested )); then break; fi
+        fi
+    done
+
+    if (( failed_count == tested )); then
+        error "原生 IPv6（$native_shown）可连外网，但抽测的 ${tested} 个新绑定 IPv6 均无法连通。"
+        error "这台 VPS 虽然网卡掩码为 /${mask}，但商家可能仅放行了面板分配的单个 IPv6，不支持自建多 IP 地址池（已自动撤销绑定）。"
+        error "你可以直接把原节点地址改为原生 IPv6（[$native_shown]）单 IP 使用。"
+        return 1
+    fi
+    if (( failed_count > 0 )); then
+        error "抽测的 ${tested} 个新绑定 IPv6 中有 ${failed_count} 个无法连通外网，商家可能限制了同时可用的 IPv6 数量。"
+        error "已自动撤销本次绑定，建议减少生成数量后重试。"
+        return 1
+    fi
+    return 0
+}
+
 prepare_pool_commit() {
     local count=$1 result index
     local -a links=() records=()
     stage_pool "$count" || return 1
+    verify_pool_reachability || return 1
     result=$(build_links "${next_pool[@]}") || return 1
     mapfile -t links <<< "$result"
     (( ${#links[@]} == ${#next_pool[@]} )) || return 1

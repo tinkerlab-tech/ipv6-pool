@@ -25,7 +25,7 @@ wget -O v6.sh https://github.com/tinkerlab-tech/ipv6-pool/raw/main/ipv6-pool.sh 
 ## 使用条件
 
 - VPS 的 IPv6 默认出口网卡需要有可用的全局单播 IPv6，地址掩码为 `/48` 至 `/64`（如 `/64`、`/56`、`/48`）。掩码小于 `/64` 时，生成地址位于原生地址所在的 `/64` 子网内，绑定沿用原掩码。
-- VPS 商家需将对应 IPv6 地址路由到你的实例。节点服务应监听 IPv6，系统和商家防火墙都需放行对应端口及传输协议。
+- VPS 商家需将对应 IPv6 地址路由到你的实例。新建或更换地址池时，脚本会自动用原生 IPv6 与抽样的新地址做公网连通性对比；若商家仅放行单个 IPv6 或限制可用数量，会自动撤销绑定并提示。节点服务应监听 IPv6，系统和商家防火墙都需放行对应端口及传输协议。
 - 需要 Bash 4.2+、完整版 `iproute2`、`flock` 和常见系统命令。Alpine 可运行 `apk add bash iproute2`，缺少 `flock` 时运行 `apk add flock`。下载命令使用 `curl` 或 `wget`，也可以直接上传 `ipv6-pool.sh`。
 - 原生支持 VLESS、Trojan、Hysteria 2（`hysteria2://` 和 `hy2://`）、Shadowsocks SIP002、AnyTLS（`anytls://`）和 TUIC v5（`tuic://`）。VMess 需要 `python3` 或 `jq`。
 - AnyTLS 和 Hysteria 2 省略端口时使用 443。Hysteria 2 地址里的跳跃端口列表或范围会写入 v2rayN 和 v2rayNG 可识别的 `mport` 参数。Trojan、AnyTLS、TUIC、Hysteria 2 和启用 TLS 的 VLESS、VMess 会沿用原先的校验名称。使用 TUIC 或 Hysteria 2 时，代理端口需放行 UDP。

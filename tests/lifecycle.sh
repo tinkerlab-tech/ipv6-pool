@@ -334,7 +334,7 @@ MV
     ip link set "$dev" up
     ip -6 addr add 2001:db8:10::2/64 dev "$dev" nodad
     ip -6 route add default dev "$dev"
-    unshare --net bash -c 'touch /run/peer.ready; exec sleep 45' &
+    unshare --net bash -c 'touch /run/peer.ready; exec sleep 120' &
     peer_pid=$!
     trap 'kill "$peer_pid" 2>/dev/null || :; wait "$peer_pid" 2>/dev/null || :' EXIT
     for _attempt in {1..30}; do
@@ -375,6 +375,60 @@ OD
     ip -o -6 addr show dev "$dev" to "$published/128" | grep -qv dadfailed
     cmp "$state/nodes.txt" /run/nodes.before
     run 5 > /run/removed
+
+    # 模拟公网对比探测：商家仅放行原生单 IP、部分限额以及全段放行。
+    cat > /run/bin/curl <<'CURL'
+#!/bin/sh
+src=''
+while [ $# -gt 0 ]; do
+    if [ "$1" = '--interface' ]; then
+        src=$2
+        shift 2
+        continue
+    fi
+    shift
+done
+mode=$(cat /run/curl.mode)
+case $mode in
+    single)
+        [ "$src" = '2001:0db8:0010:0000:0000:0000:0000:0002' ] && exit 0
+        exit 28
+        ;;
+    partial)
+        [ "$src" = '2001:0db8:0010:0000:0000:0000:0000:0002' ] && exit 0
+        if [ ! -e /run/curl.first_new ]; then
+            printf '%s\n' "$src" > /run/curl.first_new
+            exit 0
+        fi
+        first=$(cat /run/curl.first_new)
+        [ "$src" = "$first" ] && exit 0
+        exit 28
+        ;;
+    all)
+        exit 0
+        ;;
+esac
+exit 28
+CURL
+    chmod +x /run/bin/curl
+    printf '%s\n' single > /run/curl.mode
+    run 1 3 "$original" 0 > /run/first 2>&1
+    grep -Fq '商家可能仅放行了面板分配的单个 IPv6' /run/first
+    [[ ! -e $state/pool.conf && ! -e $state/ips.list ]]
+    [[ $(ip -o -6 addr show dev "$dev" scope global | wc -l) -eq 1 ]]
+
+    printf '%s\n' partial > /run/curl.mode
+    rm -f /run/curl.first_new
+    run 1 3 "$original" 0 > /run/first 2>&1
+    grep -Fq '限制了同时可用的 IPv6 数量' /run/first
+    [[ ! -e $state/pool.conf && ! -e $state/ips.list ]]
+    [[ $(ip -o -6 addr show dev "$dev" scope global | wc -l) -eq 1 ]]
+
+    printf '%s\n' all > /run/curl.mode
+    run 1 3 "$original" 0 > /run/first 2>&1
+    [[ $(wc -l < "$state/ips.list") -eq 3 ]]
+    run 5 > /run/removed
+    rm -f /run/bin/curl /run/curl.mode /run/curl.first_new
 elif [[ $backend == systemd ]]; then
     ip -6 route replace default dev "$dev"
     touch /run/systemd.fail-reload
