@@ -170,6 +170,38 @@ run 2 'tuic://00000000-0000-4000-8000-000000000001:secret%40test@[2001:db8::1]:8
 grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret%40test@[${old[0]}]:8443/?congestion_control=bbr&alpn=h3&udp_relay_mode=native&sni=tls.example.test#TUIC-v6-01" "$state/nodes.txt"
 run 2 'tuic://00000000-0000-4000-8000-000000000001:secret@example.test:443?vendor=q?#TUIC' 0 > /run/reused
 grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret@[${old[0]}]:443?vendor=q?&sni=example.test#TUIC-v6-01" "$state/nodes.txt"
+grep -Fxq '8443' "$state/udp-ports.list"
+grep -Fxq '443' "$state/udp-ports.list"
+grep -Fxq '5000-6000' "$state/udp-ports.list"
+if command -v nft >/dev/null; then
+    nft list table ip6 ipv6_pool_udp | grep -Fq 'udp dport 8443 dnat to'
+    nft list table ip6 ipv6_pool_udp | grep -Fq 'udp dport 443 dnat to'
+    nft list table ip6 ipv6_pool_udp | grep -Fq 'udp dport 5000-6000 dnat to'
+    nft delete table ip6 ipv6_pool_udp
+    "$state/ipv6-pool.sh" --restore
+    nft list table ip6 ipv6_pool_udp | grep -Fq 'udp dport 5000-6000 dnat to'
+fi
+if command -v ip6tables >/dev/null; then
+    bash_bin=$(command -v bash)
+    mkdir -p /run/ip6t-bin
+    for tool in bash ip flock awk grep od base64 tr chmod cp mv rm mkdir rmdir cat sleep ip6tables systemctl rc-update; do
+        if tool_path=$(command -v "$tool" 2>/dev/null); then
+            ln -sf "$tool_path" "/run/ip6t-bin/$tool"
+        fi
+    done
+    printf '%s\n' 2 'hysteria2://secret@example.test:13411?obfs=salamander&obfs-password=abc#HY2' 0 |
+        PATH=/run/ip6t-bin "$bash_bin" "$script" > /run/reused 2>&1
+    grep -Fxq '13411' "$state/udp-ports.list"
+    ip6tables -t nat -C PREROUTING -j IPV6_POOL_UDP
+    ip6tables -t nat -S IPV6_POOL_UDP | grep -Fq -- '--dport 13411 -j DNAT'
+    ip6tables -t nat -S IPV6_POOL_UDP | grep -Fq -- '--dport 5000:6000 -j DNAT'
+    rm -rf /run/ip6t-bin
+    if command -v nft >/dev/null; then
+        "$state/ipv6-pool.sh" --restore
+        nft list table ip6 ipv6_pool_udp | grep -Fq 'udp dport 13411 dnat to'
+        if ip6tables -t nat -S IPV6_POOL_UDP >/dev/null 2>&1; then fail 'Stale ip6tables chain survived nft restore'; fi
+    fi
+fi
 
 if command -v python3 >/dev/null; then
     vmess='{"v":"2","add":"example.test","port":"443","id":"test","ps":"a/b+c-v6-prod-v6-100","tls":"tls","extra":{"nested":true}}'
@@ -236,6 +268,8 @@ read -r new < "$state/ips.list"
 test_ip "$new" 128
 run 5 > /run/removed
 [[ ! -e $state ]]
+if command -v nft >/dev/null && nft list table ip6 ipv6_pool_udp >/dev/null 2>&1; then fail 'nft UDP NAT table survived uninstall'; fi
+if command -v ip6tables >/dev/null && ip6tables -t nat -S IPV6_POOL_UDP >/dev/null 2>&1; then fail 'ip6tables UDP NAT chain survived uninstall'; fi
 test_ip "$native" 128
 test_ip "${old[0]}" 128
 if test_ip "$new" 128; then fail 'New managed address survived uninstall'; fi
@@ -255,6 +289,8 @@ read -r address < "$state/ips.list"
 ip -o -6 addr show dev "$dev" to "$address/128" | grep -Fq '/56'
 run 5 > /run/removed
 [[ ! -e $state ]]
+if command -v nft >/dev/null && nft list table ip6 ipv6_pool_udp >/dev/null 2>&1; then fail 'nft UDP NAT table survived uninstall'; fi
+if command -v ip6tables >/dev/null && ip6tables -t nat -S IPV6_POOL_UDP >/dev/null 2>&1; then fail 'ip6tables UDP NAT chain survived uninstall'; fi
 ip -6 addr del 2402:1920:0:5600::2/56 dev "$dev"
 
 ip -6 addr add 2402:1920:0:1234::2/48 dev "$dev" nodad

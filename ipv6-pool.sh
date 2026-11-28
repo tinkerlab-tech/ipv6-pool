@@ -32,11 +32,14 @@ PROOFS=$STATE/ownership.list
 PENDING=$STATE/pending.ip
 NODES=$STATE/nodes.txt
 TRANSITION=$STATE/pool.next
+UDP_PORTS=$STATE/udp-ports.list
+NFT_TABLE=ipv6_pool_udp
+IP6T_CHAIN=IPV6_POOL_UDP
 # 匹配备注末尾的旧池标记，也能清理过去重复追加的标记。
 V6_NAME_SUFFIX='(^|-)v6(-([0-9]{2}|100))?(-v6(-([0-9]{2}|100))?)*'
 
-declare -a pool=() next_pool=() dad_failed=()
-declare -A protected=() owned=() proofs=() wanted=() present=() live=() route_sources=()
+declare -a pool=() next_pool=() dad_failed=() link_udp_ports=() udp_ports=()
+declare -A protected=() owned=() proofs=() wanted=() present=() live=() route_sources=() udp_port_set=()
 device='' prefix='' mask=''
 detected_dev='' detected_prefix='' detected_mask='' detected_ip='' detected_ip_raw='' detection_error='' link_error=''
 address_snapshot='' routes='' boot_id=''
@@ -130,12 +133,46 @@ valid_pool_ip() {
     [[ $suffix != 0000:0000:0000:0000 && $suffix != fdff:ffff:ffff:ff[89a-f][0-9a-f] ]]
 }
 
+valid_udp_port_spec() {
+    local first last
+    if [[ $1 =~ ^[1-9][0-9]{0,4}$ ]]; then
+        (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+        return
+    fi
+    if [[ $1 =~ ^([1-9][0-9]{0,4})-([1-9][0-9]{0,4})$ ]]; then
+        first=${BASH_REMATCH[1]}
+        last=${BASH_REMATCH[2]}
+        (( 10#$first >= 1 && 10#$first < 10#$last && 10#$last <= 65535 ))
+        return
+    fi
+    return 1
+}
+
+add_link_udp_ports() {
+    local raw=$1 item first last normalized existing found
+    local -a items=()
+    IFS=, read -r -a items <<< "$raw"
+    for item in "${items[@]}"; do
+        [[ $item =~ ^[0-9]{1,5}(-[0-9]{1,5})?$ ]] || continue
+        first=$((10#${item%-*}))
+        last=$((10#${item##*-}))
+        (( first >= 1 && first <= last && last <= 65535 )) || continue
+        if (( first == last )); then normalized=$first
+        else normalized="$first-$last"; fi
+        found=0
+        for existing in "${link_udp_ports[@]}"; do
+            if [[ $existing == "$normalized" ]]; then found=1; break; fi
+        done
+        if (( ! found )); then link_udp_ports+=("$normalized"); fi
+    done
+}
+
 read_state() {
-    local address proof extra
+    local address proof extra port_spec
     device='' prefix='' mask=''
-    pool=() protected=() owned=() proofs=() wanted=()
+    pool=() protected=() owned=() proofs=() wanted=() udp_ports=() udp_port_set=()
     if [[ ! -e $CONFIG ]]; then
-        [[ ! -e $IPS && ! -e $OWNED && ! -e $PROOFS && ! -e $PENDING && ! -e $TRANSITION ]]
+        [[ ! -e $IPS && ! -e $OWNED && ! -e $PROOFS && ! -e $PENDING && ! -e $TRANSITION && ! -e $UDP_PORTS ]]
         return
     fi
     read -r device prefix mask extra < "$CONFIG" || return 1
@@ -164,6 +201,15 @@ read_state() {
             valid_pool_ip "$address" && [[ $proof =~ ^[0-9a-f-]{36}:[0-9]+:[0-9]+$ && -z $extra ]] || return 1
             proofs[$address]=$proof
         done < "$PROOFS" || return 1
+    fi
+    if [[ -e $UDP_PORTS ]]; then
+        while IFS= read -r port_spec || [[ -n $port_spec ]]; do
+            valid_udp_port_spec "$port_spec" || return 1
+            if [[ ! ${udp_port_set[$port_spec]+yes} ]]; then
+                udp_ports+=("$port_spec")
+                udp_port_set[$port_spec]=1
+            fi
+        done < "$UDP_PORTS" || return 1
     fi
     (( ${#pool[@]} <= 100 ))
 }
@@ -467,13 +513,123 @@ prune_owned() {
     done
 }
 
+record_link_udp_ports() {
+    local spec
+    (( ${#link_udp_ports[@]} )) || return 0
+    for spec in "${link_udp_ports[@]}"; do
+        if [[ ! ${udp_port_set[$spec]+yes} ]]; then
+            udp_ports+=("$spec")
+            udp_port_set[$spec]=1
+        fi
+    done
+    write_file "$UDP_PORTS" "${udp_ports[@]}"
+}
+
+remove_udp_nat() {
+    if has nft && nft list table ip6 "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table ip6 "$NFT_TABLE" >/dev/null 2>&1 || true
+    fi
+    if has ip6tables && ip6tables -t nat -S "$IP6T_CHAIN" >/dev/null 2>&1; then
+        while ip6tables -t nat -D PREROUTING -j "$IP6T_CHAIN" >/dev/null 2>&1; do :; done
+        ip6tables -t nat -F "$IP6T_CHAIN" >/dev/null 2>&1 || true
+        ip6tables -t nat -X "$IP6T_CHAIN" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+apply_udp_nat_nft() {
+    local native_ip=$1 spec script=''
+    has nft || return 1
+    if nft list table ip6 "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table ip6 "$NFT_TABLE" >/dev/null 2>&1 || return 1
+    fi
+    script=$'table ip6 '"$NFT_TABLE"$' {\n'
+    script+=$'    chain prerouting {\n'
+    script+=$'        type nat hook prerouting priority -90; policy accept;\n'
+    script+="        ip6 daddr $native_ip return"$'\n'
+    for spec in "${udp_ports[@]}"; do
+        script+="        iifname \"$device\" ip6 daddr $prefix::/64 udp dport $spec dnat to $native_ip"$'\n'
+    done
+    script+=$'    }\n'
+    script+=$'}\n'
+    if ! printf '%s' "$script" | nft -f - >/dev/null 2>&1; then
+        nft delete table ip6 "$NFT_TABLE" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if has ip6tables && ip6tables -t nat -S "$IP6T_CHAIN" >/dev/null 2>&1; then
+        while ip6tables -t nat -D PREROUTING -j "$IP6T_CHAIN" >/dev/null 2>&1; do :; done
+        ip6tables -t nat -F "$IP6T_CHAIN" >/dev/null 2>&1 || true
+        ip6tables -t nat -X "$IP6T_CHAIN" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+apply_udp_nat_ip6tables() {
+    local native_ip=$1 spec dport
+    has ip6tables || return 1
+    ip6tables -t nat -N "$IP6T_CHAIN" >/dev/null 2>&1 || true
+    ip6tables -t nat -F "$IP6T_CHAIN" >/dev/null 2>&1 || return 1
+    if ! ip6tables -t nat -A "$IP6T_CHAIN" -d "$native_ip/128" -j RETURN >/dev/null 2>&1; then
+        remove_udp_nat
+        return 1
+    fi
+    for spec in "${udp_ports[@]}"; do
+        dport=${spec//-/:}
+        if ! ip6tables -t nat -A "$IP6T_CHAIN" -i "$device" -d "$prefix::/64" \
+            -p udp --dport "$dport" -j DNAT --to-destination "$native_ip" >/dev/null 2>&1; then
+            remove_udp_nat
+            return 1
+        fi
+    done
+    if ! ip6tables -t nat -C PREROUTING -j "$IP6T_CHAIN" >/dev/null 2>&1; then
+        if ! ip6tables -t nat -A PREROUTING -j "$IP6T_CHAIN" >/dev/null 2>&1; then
+            remove_udp_nat
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# 修正通配符 UDP 服务端（如 Xray/sing-box 跑 Hysteria 2/TUIC 或启用 salamander 混淆）
+# 在多 IPv6 下回包源地址退回主 IP 的问题：通过独立 DNAT 链借助 conntrack 原地址回包。
+sync_udp_nat() {
+    local announce=${1:-0} backend=''
+    if (( ! ${#pool[@]} || ! ${#udp_ports[@]} )); then
+        remove_udp_nat
+        return 0
+    fi
+    if [[ -z $detected_ip ]]; then return 0; fi
+    if apply_udp_nat_nft "$detected_ip"; then
+        backend='nftables'
+    elif apply_udp_nat_ip6tables "$detected_ip"; then
+        backend='ip6tables'
+    else
+        if (( announce )); then
+            info '提示：未能自动配置 IPv6 UDP 回包修正规则（缺少 nft/ip6tables 或内核不支持 IPv6 NAT）。若 Hysteria 2 / TUIC 新节点超时，请手动配置 IPv6 DNAT 或关闭服务端 salamander 混淆。'
+        else
+            error '未能恢复 IPv6 UDP 回包修正规则（缺少 nft/ip6tables 或内核不支持 IPv6 NAT）。'
+        fi
+        return 0
+    fi
+    if (( announce )); then
+        info "已配置 IPv6 UDP 回包修正规则（$backend，端口：${udp_ports[*]}），重启后自动恢复。"
+    fi
+    return 0
+}
+
 reconcile() {
     local address
     recover_pending && prune_owned || return 1
-    (( ${#pool[@]} )) || return 0
+    if (( ! ${#pool[@]} )); then
+        remove_udp_nat
+        return 0
+    fi
     scan_addresses || return 1
     for address in "${pool[@]}"; do bind_address "$address" || return 1; done
-    if wait_for_dad "${pool[@]}"; then return 0; fi
+    if wait_for_dad "${pool[@]}"; then
+        if (( ${#udp_ports[@]} )); then sync_udp_nat 0; fi
+        return 0
+    fi
     for address in "${dad_failed[@]}"; do error "地址 $address 重复地址检测失败。排除冲突后恢复，或选 3 更换地址池。"; done
     return 1
 }
@@ -732,8 +888,8 @@ preserve_tls_name() {
 }
 
 parse_link() {
-    local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter
-    link_error='' link_host=''
+    local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter orig_port mport_raw
+    link_error='' link_host='' link_udp_ports=()
     link_scheme=${link%%://*}
     body=${link#*://}
     if [[ -z $link_scheme || $link == "$body" ]]; then
@@ -857,8 +1013,10 @@ parse_link() {
     if [[ $link_tail == *\?* ]]; then query=${link_tail#*\?}; fi
     case $link_scheme in
         hysteria2|hy2)
+            orig_port=$link_port
             # v2rayN/NG 需要主机后的单个端口，跳跃端口通过 mport 传递。
             if [[ $link_port == *[,-]* ]]; then
+                add_link_udp_ports "$orig_port"
                 ports=${link_port//,/%2C}
                 link_port=${link_port%%[,-]*}
                 if [[ $query =~ (^|\&)mport=[^\&]* ]]; then
@@ -867,10 +1025,22 @@ parse_link() {
                 else
                     append_link_parameter mport "$ports"
                 fi
+            else
+                add_link_udp_ports "$orig_port"
+                if [[ $query =~ (^|\&)mport=([^\&]+) ]]; then
+                    mport_raw=${BASH_REMATCH[2]//%2[Cc]/,}
+                    if valid_hysteria_ports "$mport_raw"; then
+                        add_link_udp_ports "$mport_raw"
+                    fi
+                fi
             fi
             preserve_tls_name "$host"
             ;;
-        anytls|tuic) preserve_tls_name "$host" ;;
+        tuic)
+            add_link_udp_ports "$link_port"
+            preserve_tls_name "$host"
+            ;;
+        anytls) preserve_tls_name "$host" ;;
         trojan|vless)
             if [[ $query =~ (^|\&)security=([^\&]*) ]]; then security=${BASH_REMATCH[2]}; fi
             if [[ ( $security == tls || $security == reality || ( $link_scheme == trojan && -z $security ) ) &&
@@ -1060,13 +1230,19 @@ generate() {
             error '候选地址未能完全清理，重新运行后可继续清理。'
         elif (( fresh_init && ! ${#pool[@]} && ! ${#owned[@]} && ${#protected[@]} == initial_protected )) &&
             [[ ! -e $PENDING && ! -e $TRANSITION ]]; then
-            rm -f "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS"
-            device='' prefix='' mask='' protected=()
+            rm -f "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS" "$UDP_PORTS"
+            device='' prefix='' mask='' protected=() udp_ports=() udp_port_set=()
         fi
         return 1
     fi
     finish_transition || return 1
     if ! prune_owned; then error '新地址池已保存，部分旧托管地址等待清理。'; fi
+    record_link_udp_ports || return 1
+    if (( ${#link_udp_ports[@]} )); then
+        sync_udp_nat 1
+    elif (( ${#udp_ports[@]} )); then
+        sync_udp_nat 0
+    fi
     show_result
 }
 
@@ -1079,16 +1255,20 @@ reuse_pool() {
     result=$(build_links "${pool[@]}") || return 1
     mapfile -t links <<< "$result"
     (( ${#links[@]} == ${#pool[@]} )) || return 1
-    reconcile && install_boot && write_file "$NODES" "${links[@]}" && show_result
+    reconcile && install_boot && write_file "$NODES" "${links[@]}" || return 1
+    record_link_udp_ports || return 1
+    if (( ${#link_udp_ports[@]} )); then sync_udp_nat 1; fi
+    show_result
 }
 
 cleanup() {
     if [[ -n $device ]]; then
         write_file "$IPS" && read_state && reconcile || return 1
     fi
+    remove_udp_nat
     remove_boot || return 1
     local path
-    for path in "$OWNED" "$IPS" "$PROOFS" "$PENDING" "$TRANSITION" "$CONFIG" "$PROTECTED" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
+    for path in "$OWNED" "$IPS" "$PROOFS" "$PENDING" "$TRANSITION" "$UDP_PORTS" "$CONFIG" "$PROTECTED" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
         rm -f "$path" "$path.new" || return 1
     done
     rmdir "$STATE" || return 1
@@ -1157,7 +1337,7 @@ main() {
     fi
     exec 9< "$STATE" || die '无法打开状态目录。'
     flock -n 9 || die '已有另一个实例在操作地址池。'
-    for file in "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS" "$PENDING" "$TRANSITION" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
+    for file in "$CONFIG" "$PROTECTED" "$IPS" "$OWNED" "$PROOFS" "$PENDING" "$TRANSITION" "$UDP_PORTS" "$NODES" "$RUNNER" "$STATE/rc-local.mode"; do
         [[ ! -L $file && ! -L $file.new && ( ! -e $file || ( -f $file && -O $file ) ) &&
             ( ! -e $file.new || ( -f $file.new && -O $file.new ) ) ]] || die "状态文件不安全：$file"
     done
