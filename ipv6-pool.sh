@@ -812,10 +812,15 @@ port_ok = (
     or (isinstance(port, str) and re.fullmatch(r"[0-9]{1,5}", port) is not None and 1 <= int(port) <= 65535)
 )
 if (not isinstance(profile, dict) or not isinstance(profile.get("add"), str)
-        or not profile["add"] or not isinstance(profile.get("id"), str)
+        or not profile["add"] or re.search(r"[\x00-\x20\x7f|]", profile["add"])
+        or not isinstance(profile.get("id"), str)
         or not profile["id"] or not port_ok
         or not isinstance(profile.get("ps"), (str, type(None)))):
     sys.exit(1)
+if len(sys.argv) == 2:
+    net = profile.get("net") if isinstance(profile.get("net"), str) else ""
+    print("{}|{}|{}".format(profile["add"].strip("[]"), net.lower(), int(port)))
+    sys.exit(0)
 name = re.sub(sys.argv[1] + r"\Z", "", profile.get("ps") or "")
 if (profile.get("tls") in ("tls", "reality") and not profile.get("sni")
         and not profile.get("host")):
@@ -830,7 +835,7 @@ for index, address in enumerate(sys.argv[2:], 1):
         for address in "$@"; do address_lines+="$address"$'\n'; done
         decode_base64 "$vmess_payload" | jq -scr --arg addresses "$address_lines" --arg suffix "$V6_NAME_SUFFIX" '
             if length != 1 then error("expected one object") else .[0] end |
-            if type != "object" or (.add | type != "string" or length == 0)
+            if type != "object" or (.add | type != "string" or length == 0 or test("[\\x00-\\x20\\x7f|]"))
                or (.id | type != "string" or length == 0)
                or (
                    ((.port | type == "number" and . == floor and . >= 1 and . <= 65535)
@@ -839,15 +844,21 @@ for index, address in enumerate(sys.argv[2:], 1):
                )
                or ((.ps // "") | type != "string") or .ps == false
             then error("invalid profile") else . end |
-            if (.tls == "tls" or .tls == "reality") and ((.sni // "") == "") and ((.host // "") == "")
-            then .sni = (.add | sub("^\\["; "") | sub("\\]$"; "")) else . end |
-            . as $profile |
-            ((.ps // "") | sub($suffix + "\\z"; "") | if length == 0 then "" else . + "-" end) as $name |
-            ($addresses | split("\n") | map(select(length > 0)) | to_entries[]) as $entry |
-            ($entry.value) as $address |
-            (($entry.key + 1) | tostring | if length < 2 then "0" + . else . end) as $number |
-            ($profile | .add = $address | .ps = ($name + "v6-" + $number)) |
-            "vmess://" + (tojson | @base64)
+            if ($addresses | length) == 0 then
+                (.add | sub("^\\["; "") | sub("\\]$"; "")) + "|" +
+                (.net | if type == "string" then ascii_downcase else "" end) + "|" +
+                (.port | if type == "string" then (sub("^0+"; "") | if length == 0 then "0" else . end) else tostring end)
+            else
+                if (.tls == "tls" or .tls == "reality") and ((.sni // "") == "") and ((.host // "") == "")
+                then .sni = (.add | sub("^\\["; "") | sub("\\]$"; "")) else . end |
+                . as $profile |
+                ((.ps // "") | sub($suffix + "\\z"; "") | if length == 0 then "" else . + "-" end) as $name |
+                ($addresses | split("\n") | map(select(length > 0)) | to_entries[]) as $entry |
+                ($entry.value) as $address |
+                (($entry.key + 1) | tostring | if length < 2 then "0" + . else . end) as $number |
+                ($profile | .add = $address | .ps = ($name + "v6-" + $number)) |
+                "vmess://" + (tojson | @base64)
+            end
         '
     fi
 }
@@ -888,7 +899,7 @@ preserve_tls_name() {
 }
 
 parse_link() {
-    local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter orig_port mport_raw
+    local link=$1 body authority endpoint host after expanded query='' security='' ports old_parameter orig_port mport_raw vmess_meta vmess_add vmess_net vmess_port
     link_error='' link_host='' link_udp_ports=()
     link_scheme=${link%%://*}
     body=${link#*://}
@@ -912,13 +923,18 @@ parse_link() {
                 return 1
             fi
             vmess_payload=$body
-            if ! vmess_links >/dev/null 2>&1; then
+            if ! vmess_meta=$(vmess_links 2>/dev/null); then
                 if [[ $body == *@* ]]; then
                     link_error='VMess 仅支持标准 Base64 JSON 格式（vmess://base64...）。'
                 else
                     link_error='VMess 链接无效，Base64 解码失败或缺少有效的地址、端口或凭据配置。'
                 fi
                 return 1
+            fi
+            IFS='|' read -r vmess_add vmess_net vmess_port <<< "$vmess_meta"
+            link_host=$vmess_add
+            if [[ $vmess_net == kcp || $vmess_net == quic ]]; then
+                add_link_udp_ports "$vmess_port"
             fi
             return 0
             ;;
@@ -1040,8 +1056,14 @@ parse_link() {
             add_link_udp_ports "$link_port"
             preserve_tls_name "$host"
             ;;
+        ss)
+            add_link_udp_ports "$link_port"
+            ;;
         anytls) preserve_tls_name "$host" ;;
         trojan|vless)
+            if [[ $query =~ (^|\&)[Tt][Yy][Pp][Ee]=([Kk][Cc][Pp]|[Qq][Uu][Ii][Cc])($|\&) ]]; then
+                add_link_udp_ports "$link_port"
+            fi
             if [[ $query =~ (^|\&)security=([^\&]*) ]]; then security=${BASH_REMATCH[2]}; fi
             if [[ ( $security == tls || $security == reality || ( $link_scheme == trojan && -z $security ) ) &&
                 ! $query =~ (^|\&)(host|authority)=[^\&]+ ]]; then

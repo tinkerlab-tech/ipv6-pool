@@ -160,6 +160,8 @@ grep -Fq 'Hysteria 2 端口无效' /run/reused
 grep -Fxq "hy2://secret@[${old[0]}]:443/?sni=example.test&mport=443%2C5000-6000#Hop-v6-01" "$state/nodes.txt"
 run 2 'vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@example.test:443?security=tls#TLS' 0 > /run/reused
 grep -Fxq "vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@[${old[0]}]:443?security=tls&sni=example.test#TLS-v6-01" "$state/nodes.txt"
+run 2 'vless://b0e0796f-fb83-452b-9179-fecd0a5fb8a3@example.test:9443?type=kcp#KCP' 0 > /run/reused
+grep -Fxq '9443' "$state/udp-ports.list"
 run 2 'anytls://secret%3A%40@example.test/?insecure=0&vendor=q%3D%2B#AnyTLS' 0 > /run/reused
 grep -Fxq "anytls://secret%3A%40@[${old[0]}]:443/?insecure=0&vendor=q%3D%2B&sni=example.test#AnyTLS-v6-01" "$state/nodes.txt"
 run 2 'anytls://secret@198.51.100.1:8443?sni=&peer=tls.example.test&insecure=0#AnyTLS' 0 > /run/reused
@@ -170,6 +172,7 @@ run 2 'tuic://00000000-0000-4000-8000-000000000001:secret%40test@[2001:db8::1]:8
 grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret%40test@[${old[0]}]:8443/?congestion_control=bbr&alpn=h3&udp_relay_mode=native&sni=tls.example.test#TUIC-v6-01" "$state/nodes.txt"
 run 2 'tuic://00000000-0000-4000-8000-000000000001:secret@example.test:443?vendor=q?#TUIC' 0 > /run/reused
 grep -Fxq "tuic://00000000-0000-4000-8000-000000000001:secret@[${old[0]}]:443?vendor=q?&sni=example.test#TUIC-v6-01" "$state/nodes.txt"
+grep -Fxq '8388' "$state/udp-ports.list"
 grep -Fxq '8443' "$state/udp-ports.list"
 grep -Fxq '443' "$state/udp-ports.list"
 grep -Fxq '5000-6000' "$state/udp-ports.list"
@@ -230,7 +233,7 @@ if command -v jq >/dev/null; then
     vmess_int='{"v":"2","add":"example.test","port":443,"id":"test","ps":"jq-v6-02","tls":"tls","extra":{"nested":true}}'
     encoded_int=$(printf '%s' "$vmess_int" | base64 | tr -d '\n')
     bad_vmess_port=$(printf '%s' '{"v":"2","add":"example.test","port":true,"id":"test"}' | base64 | tr -d '\n')
-    vmess_zero_port='{"v":"2","add":"example.test","port":"0443","id":"test","ps":"zero"}'
+    vmess_zero_port='{"v":"2","add":"example.test","port":"07443","id":"test","ps":"zero","net":"KCP"}'
     encoded_zero=$(printf '%s' "$vmess_zero_port" | base64 | tr -d '\n')
     printf '%s\n' 2 "vmess://uuid@example.test:443" "vmess://$bad_vmess_port" "vmess://$encoded_int" 0 |
         PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
@@ -250,6 +253,7 @@ PY
     fi
     printf '%s\n' 2 "vmess://$encoded_zero" 0 | PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
     grep -Fq 'vmess://' "$state/nodes.txt"
+    grep -Fxq '7443' "$state/udp-ports.list"
     rm -f /run/jq-bin/jq
     printf '%s\n' 2 "vmess://$encoded_int" '' 0 | PATH=/run/jq-bin "$bash_bin" "$script" > /run/reused 2>&1
     grep -Fq 'VMess 需要 python3 或 jq' /run/reused
